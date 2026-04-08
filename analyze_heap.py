@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 # Import markdown to HTML converter
@@ -44,6 +45,19 @@ try:
     HTML_CONVERSION_AVAILABLE = True
 except ImportError:
     HTML_CONVERSION_AVAILABLE = False
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {secs:.0f}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m {secs:.0f}s"
 
 
 def detect_file_mode(data_file: str) -> str:
@@ -77,166 +91,284 @@ def build_prompt(output_file: str,
                  base_repo: str,
                  target_repo: str,
                  min_size_mb: float,
-                 mode: str = "diff") -> str:
-    """Build the compact instruction prompt for Claude.
+                 mode: str = "diff",
+                 data_file: str = "") -> str:
+    """Build the analysis prompt for Claude.
 
-    This prompt contains NO data — it just tells Claude to use the MCP tools
-    and source code search to perform the analysis.
+    Uses a single template for both snapshot and diff modes, with only
+    the title, header rows, and source section varying.
     """
     same_repo = os.path.normpath(base_repo) == os.path.normpath(target_repo)
 
+    # --- Mode-specific bits (kept minimal) ---
     if mode == "snapshot":
-        # Snapshot mode: single-profile analysis
-        repo_section = f"Source code repository: {base_repo}"
+        report_title = "内存快照分析报告"
+        header_rows = f"| 代码版本 | {os.path.basename(base_repo)} |"
+        source_section = f"Source code repository: {base_repo}" if base_repo else "No source code repository provided."
+        source_repo = base_repo
+    else:
+        report_title = "内存对比分析报告"
+        header_rows = (
+            f"| 基线版本 | {os.path.basename(base_repo)} |\n"
+            f"| 对比版本 | {os.path.basename(target_repo)} |"
+        )
+        if same_repo:
+            source_section = f"""Source code repository: {base_repo}
+The two profiles are from different runs/builds of the same codebase."""
+        else:
+            source_section = f"""Baseline source code: {base_repo}
+Comparison source code: {target_repo}
+The profiles are from different versions. You can diff files between repos."""
+        source_repo = target_repo if os.path.isdir(target_repo) else base_repo
 
-        return f"""Analyze a LoliProfiler heap snapshot using the loli-heap MCP tools, then cross-reference
-source code to produce a detailed Chinese-language report.
+    source_grep_instruction = (
+        f'Use Grep and Read tools to search the source repository at {source_repo} '
+        'for the function name. Analyze: what data structures are allocated, '
+        'buffer sizes, container growth, caching behavior.'
+        if base_repo else 'No source repo — skip source code analysis.'
+    )
 
-{repo_section}
+    return f"""You are a memory analysis agent. Analyze a LoliProfiler {report_title} using the loli-heap MCP tools,
+then produce a structured Chinese-language report. Follow the phases below EXACTLY in order.
+Do NOT skip phases. Do NOT reorder phases.
 
-STEP-BY-STEP WORKFLOW:
+{source_section}
 
-1. Call get_summary() to understand overall stats (total allocations, total size).
-2. Call get_top_allocations(20, {min_size_mb}) to find the biggest allocation hotspots.
-3. For each significant hotspot:
-   a. Call get_call_path(node_id) to see the full calling context.
-   b. Call get_children(node_id) to see where memory branches below it.
-   c. Use Grep/Read on the source code to find and understand the implementation.
-   d. Determine WHAT data structures consume the most memory and WHY.
-4. Optionally use search_function(pattern) to find specific modules or classes.
-5. Write the complete analysis report.
+═══════════════════════════════════════════════════════════════
+PHASE 1: DATA LOADING & THREAD DISCOVERY (you do this yourself)
+═══════════════════════════════════════════════════════════════
 
-IMPORTANT ANALYSIS GUIDELINES:
-- Skip generic thread wrappers (FRunnableThreadPThread::Run, -[IOSAppDelegate MainAppThread:],
-  FEngineLoop::Tick, etc.) — drill down to FUNCTIONAL-LEVEL functions.
-- Focus on functions that describe specific work: rendering, audio, physics, AI, loading, etc.
-- Only analyze allocations >= {min_size_mb} MB.
-- This is READ-ONLY analysis. DO NOT modify any source code files.
-- This is a SNAPSHOT (single profile), not a diff. Analyze memory DISTRIBUTION, not growth.
+Execute these tool calls in order:
 
-REPORT FORMAT (Chinese, code/function names in English):
+1. load_file("{os.path.abspath(data_file)}")
+2. get_summary() — record the total size, total allocations, root count for the report header.
+3. search_function("Thread") — find all thread-related nodes.
+   From the results, identify **thread entry-point nodes**: nodes whose function name
+   contains a thread identifier (e.g. *Thread*::Run, *ThreadFunc, *ThreadMain,
+   *Thread*Proc, *thread_create*) AND whose size >= {min_size_mb} MB.
+   Record each thread's node_id, function name, and size.
+4. get_top_allocations(30, {min_size_mb}) — find the 30 largest allocation nodes.
+   For each result, check whether it is a descendant of any thread entry-point
+   found in step 3 (use get_call_path to check if uncertain).
+   Nodes NOT under any identified thread go into the "Others" group.
 
-# 内存快照分析报告
+After Phase 1 you must have:
+  - A list of thread entry-points: [(node_id, name, size_mb), ...]
+  - A list of "Others" nodes: [(node_id, name, size_mb), ...]
+  - Summary stats for the report header
 
-生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-分析工具: LoliProfiler
-代码版本: {os.path.basename(base_repo)}
+═══════════════════════════════════════════════════════════════
+PHASE 2: PER-THREAD HOTSPOT DISCOVERY (parallel sub-agents)
+═══════════════════════════════════════════════════════════════
+
+For EACH thread entry-point from Phase 1, dispatch ONE sub-agent with the Agent tool.
+Also dispatch ONE sub-agent for the "Others" group.
+Launch ALL these sub-agents IN PARALLEL (multiple Agent tool calls in a single message).
+
+Each **thread sub-agent** receives this brief (fill in the bracketed values):
+
+    You are analyzing memory allocations under thread "[thread_name]" (node_id=[id], size=[X] MB)
+    in a LoliProfiler heap profile.
+
+    Execute these steps:
+    1. Call get_subtree([thread_node_id], 6) to see the call tree structure.
+    2. Starting from the largest children, call get_children recursively (up to 3 levels)
+       to find the hotspot leaf nodes — functions where memory actually accumulates.
+    3. Select the top 3-5 hotspots by size (each must be >= {min_size_mb} MB).
+       Skip generic wrappers (operator new, malloc, FMemory::Malloc, etc.) — pick
+       the deepest FUNCTIONAL-level function in each branch.
+    4. For each hotspot, call get_call_path(node_id) to get the full calling context.
+
+    Return your results as EXACTLY this format (no other text):
+    THREAD: [thread_name]
+    THREAD_NODE_ID: [id]
+    THREAD_SIZE_MB: [size]
+    HOTSPOTS:
+    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
+    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
+    ...
+
+The **"Others" sub-agent** receives this brief:
+
+    You are analyzing large memory allocations that are NOT under any identified thread.
+    The following nodes were identified as "Others":
+    [list each node_id, name, size_mb]
+
+    For each node (up to 10):
+    1. Call get_call_path(node_id) to see its full context.
+    2. Call get_children(node_id) to see sub-allocations.
+    3. Determine the top 3-5 hotspots across all "Others" nodes (>= {min_size_mb} MB).
+       Skip generic wrappers — pick the deepest functional-level function.
+
+    Return your results as EXACTLY this format:
+    THREAD: Others
+    THREAD_NODE_ID: N/A
+    THREAD_SIZE_MB: [total]
+    HOTSPOTS:
+    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
+    ...
+
+═══════════════════════════════════════════════════════════════
+PHASE 3: PER-HOTSPOT DEEP ANALYSIS (parallel sub-agents)
+═══════════════════════════════════════════════════════════════
+
+Collect ALL hotspots from ALL Phase 2 sub-agents. For EACH hotspot, dispatch a sub-agent.
+Launch ALL these sub-agents IN PARALLEL (multiple Agent tool calls in a single message).
+
+Each **hotspot sub-agent** receives this brief:
+
+    You are performing deep analysis on a memory hotspot in a LoliProfiler heap profile.
+    Function: [function_name]
+    Node ID: [node_id]
+    Size: [X.X] MB
+    Thread context: [thread_name]
+    Call path: [call_path_summary from Phase 2]
+
+    Execute these steps:
+    1. Call get_call_path([node_id]) to get the full annotated call stack.
+    2. Call get_children([node_id]) to see what sub-allocations exist below.
+    3. {source_grep_instruction}
+
+    Return your analysis as EXACTLY this format:
+
+    HOTSPOT_ANALYSIS:
+    function: [full function name]
+    node_id: [id]
+    size_mb: [X.X]
+    thread: [thread_name]
+
+    CALL_STACK (use tree format with └── and indentation, include size at each frame):
+    FunctionRoot (XX.X MB)
+    └── ChildFunction (XX.X MB)
+        └── GrandchildFunction (XX.X MB)
+            └── ... down to the hotspot function
+
+    CODE_LOCATION: [file:line if found, or "N/A"]
+
+    SOURCE_ANALYSIS:
+    [2-3 sentences: what this code does, what data structures it allocates]
+
+    ROOT_CAUSE:
+    [2-3 sentences: why this allocation is large]
+
+    OPTIMIZATION:
+    [2-3 sentences: specific, actionable optimization suggestions]
+
+═══════════════════════════════════════════════════════════════
+PHASE 4: REPORT ASSEMBLY (you do this yourself)
+═══════════════════════════════════════════════════════════════
+
+Gather ALL results from Phase 2 and Phase 3. Assemble the final report using
+EXACTLY this template. Do not add extra sections. Do not remove sections.
+Fill in all [...] placeholders with actual data.
+
+---BEGIN TEMPLATE---
+
+# {report_title}
+
+| 项目 | 值 |
+|------|-----|
+| 生成时间 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |
+| 分析工具 | LoliProfiler + Claude Code |
+{header_rows}
 
 ## 内存分布概况
 
-[总体内存使用情况，各模块占比]
+| 指标 | 值 |
+|------|-----|
+| 总内存 | [total size from get_summary] |
+| 总分配次数 | [total allocs from get_summary] |
+| 根节点数 | [root count] |
+| 识别线程数 | [number of threads found in Phase 1] |
 
-## 主要内存占用分析
+[1-2 sentences summarizing the overall memory distribution across threads]
 
-### [1] [函数名] - [内存大小]
+## 线程内存分布
+
+| 线程 | 内存占用 | 占比 |
+|------|---------|------|
+| [Thread 1 name] | [X.X MB] | [X.X%] |
+| [Thread 2 name] | [X.X MB] | [X.X%] |
+| ... | ... | ... |
+| Others | [X.X MB] | [X.X%] |
+
+## [Thread 1 name] ([X.X MB])
+
+### [1] [函数名] — [X.X MB]
 
 **完整调用栈:**
 ```
-[从get_call_path获取的调用链]
+FunctionRoot (XX.X MB)
+└── ChildFunction (XX.X MB)
+    └── GrandchildFunction (XX.X MB)
+        └── HotspotFunction (XX.X MB)
 ```
 
-**代码位置:** [file:line]
+**代码位置:** [file:line or N/A]
 
-**源码分析:** [读取源码后说明这段代码做什么、分配什么数据结构]
+**源码分析:** [from Phase 3 SOURCE_ANALYSIS]
 
-**内存占用原因:** [结合源码分析解释为什么这里占用这么多内存]
+**内存占用原因:** [from Phase 3 ROOT_CAUSE]
 
-**优化建议:** [具体可行的优化方向]
+**优化建议:** [from Phase 3 OPTIMIZATION]
 
 ---
 
-(repeat for each significant hotspot)
+(repeat for all hotspots in this thread, numbered sequentially, sorted by size descending)
+
+## [Thread 2 name] ([X.X MB])
+
+(same structure as above)
+
+## Others ([X.X MB])
+
+(same structure for non-thread hotspots)
 
 ## 优化优先级建议
 
-[按影响大小和实施难度排序]
+| 优先级 | 函数 | 线程 | 内存占用 | 难度 | 建议 |
+|--------|------|------|---------|------|------|
+| 1 | [func] | [thread] | [X.X MB] | [高/中/低] | [one-line summary] |
+| 2 | ... | ... | ... | ... | ... |
+
+(list all hotspots ranked by impact, top priority first)
 
 ## 总结
 
-[整体内存分布分析和关键建议]
+[3-5 sentences: overall memory distribution patterns, key findings, top 3 recommendations]
 
-CRITICAL: Save the complete report to: {output_file}
-Use the Write tool to save it. After saving, confirm with: "Report saved to: {output_file}"
-"""
-    else:
-        # Diff mode: two-profile comparison (original behavior)
-        if same_repo:
-            repo_section = f"""Source code repository: {base_repo}
-The two profiles are from different runs/builds of the same codebase."""
-        else:
-            repo_section = f"""Baseline source code: {base_repo}
-Comparison source code: {target_repo}
-The profiles are from different versions. You can diff files between repos."""
+## 分析统计
 
-        return f"""Analyze a LoliProfiler heap diff using the loli-heap MCP tools, then cross-reference
-source code to produce a detailed Chinese-language report.
+| 指标 | 值 |
+|------|-----|
+| 分析热点数 | [total hotspots analyzed across all threads] |
+| 识别线程数 | [number of threads found] |
+| 派遣子代理数 | [total sub-agents dispatched in Phase 2 + Phase 3] |
+| MCP 工具调用次数 | [estimated total loli-heap tool calls across all agents] |
 
-{repo_section}
+---END TEMPLATE---
 
-STEP-BY-STEP WORKFLOW:
-
-1. Call get_summary() to understand overall stats.
-2. Call get_top_allocations(20, {min_size_mb}) to find the biggest growth points.
-3. For each significant hotspot:
-   a. Call get_call_path(node_id) to see the full calling context.
-   b. Call get_children(node_id) to see where memory branches below it.
-   c. Use Grep/Read on the source code to find and understand the implementation.
-   d. Determine WHY memory grows at this point and WHAT data structures are involved.
-4. Optionally use search_function(pattern) to find specific modules or classes.
-5. Write the complete analysis report.
-
-IMPORTANT ANALYSIS GUIDELINES:
-- Skip generic thread wrappers (FRunnableThreadPThread::Run, -[IOSAppDelegate MainAppThread:],
-  FEngineLoop::Tick, etc.) — drill down to FUNCTIONAL-LEVEL functions.
-- Focus on functions that describe specific work: rendering, audio, physics, AI, loading, etc.
+IMPORTANT RULES:
 - Only analyze allocations >= {min_size_mb} MB.
-- This is READ-ONLY analysis. DO NOT modify any source code files.
-
-REPORT FORMAT (Chinese, code/function names in English):
-
-# 内存分析报告
-
-生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-分析工具: LoliProfiler
-基线版本: {os.path.basename(base_repo)}
-对比版本: {os.path.basename(target_repo)}
-
-## 主要内存增长点分析
-
-### [1] [函数名] - [内存增长量]
-
-**完整调用栈:**
-```
-[从get_call_path获取的调用链]
-```
-
-**代码位置:** [file:line]
-
-**源码分析:** [读取源码后说明这段代码做什么、分配什么数据结构]
-
-**增长原因:** [结合源码分析解释为什么产生这么多内存分配]
-
-**优化建议:** [具体可行的优化方向]
-
----
-
-(repeat for each significant hotspot)
-
-## 优化优先级建议
-
-[按影响大小和实施难度排序]
-
-## 总结
-
-[整体趋势分析和关键建议]
+- This is READ-ONLY analysis. Do NOT modify any source code files.
+- Skip generic wrappers (operator new, malloc, FMemory::*, etc.) — drill to functional-level functions.
+- All prose in Chinese. All code/function names in English.
+- Sort threads by size descending. Sort hotspots within each thread by size descending.
+- The "分析统计" table MUST be the very last content in the file.
+  The harness will append a "总耗时" row to it. Ensure the table ends with a normal
+  table row followed by a newline. Do NOT put any text after the stats table.
 
 CRITICAL: Save the complete report to: {output_file}
 Use the Write tool to save it. After saving, confirm with: "Report saved to: {output_file}"
 """
 
 
-def build_mcp_config(data_file: str) -> dict:
-    """Build the MCP server configuration."""
+def build_mcp_config() -> dict:
+    """Build the MCP server configuration.
+
+    The server starts empty (no --file) so it connects to Claude instantly.
+    The prompt instructs Claude to call load_file() as the first step.
+    """
     server_script = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         'mcp_server', 'heap_explorer_server.py'
@@ -245,7 +377,7 @@ def build_mcp_config(data_file: str) -> dict:
         "mcpServers": {
             "loli-heap": {
                 "command": sys.executable,
-                "args": [server_script, "--file", os.path.abspath(data_file)],
+                "args": [server_script],
                 "env": {}
             }
         }
@@ -273,7 +405,7 @@ def run_analysis(data_file: str,
     print(f"Data file: {data_file} [mode: {mode}]")
 
     # Write temporary MCP config
-    mcp_config = build_mcp_config(data_file)
+    mcp_config = build_mcp_config()
     with tempfile.TemporaryDirectory(prefix='loli_mcp_') as tmp_dir:
         mcp_config_path = os.path.join(tmp_dir, '.mcp.json')
         with open(mcp_config_path, 'w') as f:
@@ -284,7 +416,7 @@ def run_analysis(data_file: str,
 
         # Build prompt
         abs_output = os.path.abspath(output_file)
-        prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb, mode=mode)
+        prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb, mode=mode, data_file=data_file)
 
         prompt_size_kb = len(prompt.encode('utf-8')) / 1024
         print(f"Prompt size: {prompt_size_kb:.1f} KB (no data embedded — uses MCP tools)")
@@ -300,6 +432,7 @@ def run_analysis(data_file: str,
             # WARNING: --dangerously-skip-permissions allows Claude to execute
             # arbitrary tools without user confirmation. This is required for
             # batch/CI usage but should only be used in trusted environments.
+            t_start = time.monotonic()
             result = subprocess.run(
                 [
                     claude_cmd, '-p',
@@ -316,6 +449,7 @@ def run_analysis(data_file: str,
                 cwd=cwd,
                 shell=is_windows,
             )
+            duration_sec = time.monotonic() - t_start
 
             if result.returncode != 0:
                 print(f"Claude analysis failed (exit {result.returncode}):", file=sys.stderr)
@@ -339,6 +473,9 @@ def run_analysis(data_file: str,
             else:
                 print("Claude returned empty response", file=sys.stderr)
                 return False
+
+            # Print timing to console
+            print(f"\nAnalysis duration: {_format_duration(duration_sec)}")
 
             # Preview
             print()
