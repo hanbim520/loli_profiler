@@ -517,11 +517,6 @@ Examples:
 
   # HTML output with custom threshold
   python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0 -o report.html
-
-Compared to analyze_memory_diff.py, this version:
-  - Sends ~2KB prompt instead of megabytes of data
-  - Claude explores data interactively via MCP tools
-  - Works with arbitrarily large files (tested with 588K+ nodes)
         """
     )
 

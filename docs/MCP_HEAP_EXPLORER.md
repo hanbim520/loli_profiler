@@ -34,17 +34,6 @@ Claude Code
 Analysis Report (markdown/HTML)
 ```
 
-### Comparison with analyze_memory_diff.py
-
-| Aspect | analyze_memory_diff.py | analyze_heap.py (MCP) |
-|--------|----------------------|----------------------|
-| Data in prompt | Full file content (MB) | ~2KB instruction only |
-| Context usage | Saturates window | ~10-20KB across tool calls |
-| Max file size | Limited by context window | Unlimited (tested 588K+ nodes) |
-| Analysis style | One-shot | Interactive exploration |
-| Source code search | Yes | Yes |
-| Snapshot support | No | Yes |
-
 ## Prerequisites
 
 Install the MCP Python SDK:

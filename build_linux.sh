@@ -72,8 +72,6 @@ bash scripts/Deployqt_linux.sh
 
 # Copy Python analysis scripts
 echo "Copying Python analysis scripts..."
-cp -v analyze_memory_diff.py $DeployPath/LoliProfiler/
-cp -v preprocess_memory_diff.py $DeployPath/LoliProfiler/
 cp -v markdown_to_html.py $DeployPath/LoliProfiler/
 cp -v analyze_heap.py $DeployPath/LoliProfiler/
 cp -v requirements.txt $DeployPath/LoliProfiler/

@@ -99,9 +99,14 @@ LoliProfiler/
 ├── qt.conf                  # Qt configuration
 ├── lib/                     # Qt and other dependencies
 ├── plugins/                 # Qt plugins
-├── analyze_memory_diff.py   # Python analysis script
-├── preprocess_memory_diff.py
-└── markdown_to_html.py
+├── analyze_heap.py          # MCP-based AI analysis script
+├── markdown_to_html.py      # Markdown to HTML converter
+├── requirements.txt         # Python dependencies
+├── mcp_server/              # MCP heap explorer server
+│   ├── __init__.py
+│   ├── tree_model.py
+│   └── heap_explorer_server.py
+└── .mcp.json                # MCP server configuration
 ```
 
 ## Platform Compatibility

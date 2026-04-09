@@ -17,8 +17,6 @@ echo %DeployPath%
 xcopy /S /Q %RelasePath%\* %DeployPath%\LoliProfiler\*
 
 echo Copying Python analysis scripts...
-copy /Y "%~dp0..\analyze_memory_diff.py" "%DeployPath%\LoliProfiler\"
-copy /Y "%~dp0..\preprocess_memory_diff.py" "%DeployPath%\LoliProfiler\"
 copy /Y "%~dp0..\markdown_to_html.py" "%DeployPath%\LoliProfiler\"
 copy /Y "%~dp0..\analyze_heap.py" "%DeployPath%\LoliProfiler\"
 copy /Y "%~dp0..\requirements.txt" "%DeployPath%\LoliProfiler\"
