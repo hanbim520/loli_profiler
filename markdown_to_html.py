@@ -56,12 +56,12 @@ def convert_headers(text: str) -> str:
 
 def convert_bold_italic(text: str) -> str:
     """Convert bold and italic text."""
-    # Bold: **text** or __text__
-    text = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', text)
-    text = re.sub(r'__([^_]+)__', r'<strong>\1</strong>', text)
-    # Italic: *text* or _text_
-    text = re.sub(r'\*([^*]+)\*', r'<em>\1</em>', text)
-    text = re.sub(r'(?<![_\w])_([^_]+)_(?![_\w])', r'<em>\1</em>', text)
+    # Bold: **text** or __text__ (single-line only)
+    text = re.sub(r'\*\*([^*\n]+)\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'__([^_\n]+)__', r'<strong>\1</strong>', text)
+    # Italic: *text* or _text_ (single-line only)
+    text = re.sub(r'\*([^*\n]+)\*', r'<em>\1</em>', text)
+    text = re.sub(r'(?<![_\w])_([^_\n]+)_(?![_\w])', r'<em>\1</em>', text)
     return text
 
 

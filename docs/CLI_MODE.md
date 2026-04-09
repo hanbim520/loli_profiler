@@ -249,146 +249,32 @@ FRunnableThreadPThread::Run(), +18.44 MB, +79446
 
 ## AI-Powered Memory Analysis
 
-For large diff files, use the `analyze_memory_diff.py` script to generate detailed analysis reports using Claude Code.
+For automated analysis of diff or snapshot files, use `analyze_heap.py` which launches an MCP server and Claude Code to interactively explore heap data and generate detailed reports.
 
-### Analysis Pipeline
+### Quick Start
 
-```mermaid
-flowchart LR
-    subgraph Input["📥 Input"]
-        A[("diff.txt<br/>~3 MB<br/>154 nodes")]
-    end
+```bash
+# Analyze a diff
+python analyze_heap.py diff.txt --repo /path/to/source -o report.md
 
-    subgraph Preprocess["🔧 Preprocessing"]
-        B["Parse Tree Structure"]
-        C["Filter ≥ Threshold MB"]
-        D["Pattern Matching"]
-        E["Deduplicate"]
+# Analyze a heap snapshot
+python analyze_heap.py snapshot.txt --repo /path/to/source -o report.md
 
-        B --> C
-        C --> D
-        D --> E
+# HTML output
+python analyze_heap.py diff.txt --repo /path/to/source -o report.html
 
-        D -.- D1["Skip low-level:<br/>FMemory::, TArray::,<br/>operator new, etc."]
-        D -.- D2["Keep functional:<br/>U*::, A*::, CAk*::,<br/>Manager/System classes"]
-        C -.- C1["Climb tree to find<br/>functional ancestors<br/>for significant nodes"]
-    end
+# Different repos for baseline vs comparison
+python analyze_heap.py diff.txt --base-repo /path/to/v1 --target-repo /path/to/v2
 
-    subgraph Output["📤 Filtered Output"]
-        F[("filtered.txt<br/>~10 KB<br/>3 trees")]
-    end
-
-    subgraph Analyze["🤖 Claude Code Analysis"]
-        G["Search Source Code"]
-        H["Read Implementation"]
-        I["Analyze Allocations"]
-        J["Generate Report"]
-
-        G --> H
-        H --> I
-        I --> J
-    end
-
-    subgraph Report["📋 Report"]
-        K[("report.md<br/>Chinese<br/>Optimization<br/>Suggestions")]
-    end
-
-    A --> B
-    E --> F
-    F --> G
-    J --> K
+# Custom minimum size threshold
+python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0
 ```
 
 ### How It Works
 
-1. **Preprocessing** (`preprocess_memory_diff.py`):
-   - Parses the tree-structured diff.txt file
-   - Filters call stacks by memory threshold (default: ≥ 2 MB)
-   - Uses regex patterns to identify functional-level vs low-level functions
-   - Climbs the call tree to find meaningful allocation points
-   - Deduplicates identical call stacks
-   - Reduces ~3 MB input to ~10 KB filtered output (99%+ reduction)
+Instead of embedding the entire data file into a prompt, `analyze_heap.py` starts an MCP server that loads the data into an indexed in-memory tree. Claude Code explores the data interactively via tool calls (~10-20KB of context), searches source code, and writes a structured Chinese-language report.
 
-2. **Analysis** (`analyze_memory_diff.py`):
-   - Auto-detects large files and triggers preprocessing
-   - Sends filtered data to Claude Code
-   - Claude searches source code repositories for function implementations
-   - Analyzes what data structures are allocated and why
-   - Generates Chinese markdown report with optimization suggestions
-
-### Usage
-
-**Basic analysis:**
-```bash
-python analyze_memory_diff.py diff.txt --repo /path/to/source -o report.md
-```
-
-**With separate baseline/target repos:**
-```bash
-python analyze_memory_diff.py diff.txt \
-    --base-repo /path/to/baseline/source \
-    --target-repo /path/to/current/source \
-    -o report.md
-```
-
-**Standalone preprocessing:**
-```bash
-python preprocess_memory_diff.py diff.txt -o filtered.txt --threshold 2.0 --verbose
-```
-
-### Analysis Options
-
-| Option | Description |
-|--------|-------------|
-| `--repo <path>` | Source code repository (used for both versions) |
-| `--base-repo <path>` | Baseline version source code |
-| `--target-repo <path>` | Current version source code |
-| `-o, --output <path>` | Output report file (default: timestamped .md) |
-| `--min-size <MB>` | Minimum memory threshold (default: 2.0 MB) |
-| `-t, --timeout <sec>` | Analysis timeout (default: 1800 = 30 min) |
-
-### Pattern Matching
-
-The preprocessing uses hardcoded patterns for UE4/Wwise projects:
-
-**Low-level patterns (filtered out):**
-- `FMemory::`, `operator new`, `malloc`
-- `TArray::`, `TMap::`, `TSet::`
-- `FPropertyTag::`, `FArchive::`, `FLinkerLoad::`
-- `FString::`, `FName::`, `FText::`
-
-**Functional-level patterns (kept):**
-- `U[A-Z]*::` - UObject-derived classes
-- `A[A-Z]*::` - AActor-derived classes
-- `F*Manager::`, `F*System::` - Manager/System classes
-- `CAk*::`, `Ak*::` - Wwise audio API
-
-### Example Report Output
-
-```markdown
-# 内存分析报告
-
-生成时间: 2026-01-27 10:00:00
-分析工具: LoliProfiler
-基线版本: ua0919
-对比版本: ua1219
-
-## 主要内存增长点分析
-
-### [1] UDataTable::LoadStructData - +5.20 MB
-
-**完整调用栈:**
-FAsyncLoadingThread::Run()
-    → FAsyncPackage::EventDrivenSerializeExport()
-        → UDataTable::Serialize()
-            → UDataTable::LoadStructData()
-
-**代码位置:** Engine/Source/Runtime/Engine/Private/DataTable.cpp:88
-
-**增长原因:** 大量DataTable行数据加载，每行通过FMemory::Malloc独立分配
-
-**优化建议:** 使用内存池分配相同RowStruct的行数据，减少碎片
-```
+For full details on the MCP tools, interactive mode, and architecture, see [MCP Heap Explorer](MCP_HEAP_EXPLORER.md).
 
 ## See Also
 
