@@ -60,16 +60,24 @@ def _find_loli_cli() -> str | None:
     if env_path and os.path.isfile(env_path):
         return env_path
 
-    # 2. Sibling of mcp_server/ directory
+    # 2. Sibling of mcp_server/ directory.
+    # On Windows the .exe is self-contained. On Linux the bare ELF binary
+    # cannot find its bundled Qt libraries in ./lib/ without LD_LIBRARY_PATH,
+    # so we must invoke the LoliProfilerCLI.sh wrapper that sets that up.
+    if sys.platform == "win32":
+        candidates = ("LoliProfilerCLI.exe",)
+    else:
+        candidates = ("LoliProfilerCLI.sh",)
+
     server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name in ("LoliProfilerCLI.exe", "LoliProfilerCLI"):
+    for name in candidates:
         candidate = os.path.join(server_dir, name)
         if os.path.isfile(candidate):
             return candidate
 
     # 3. System PATH
     import shutil
-    for name in ("LoliProfilerCLI.exe", "LoliProfilerCLI"):
+    for name in candidates:
         found = shutil.which(name)
         if found:
             return found
