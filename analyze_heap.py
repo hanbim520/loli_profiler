@@ -8,12 +8,16 @@ data and exposes query tools. The LLM interactively explores the heap data,
 searches source code, and writes a report — with only ~10-20KB of focused data
 entering the context window.
 
-Supports both file formats:
-  - Diff files from `LoliProfilerCLI --compare` (two-profile comparison)
-  - Snapshot files from `LoliProfilerCLI --dump` (single-profile export)
+Supports these file formats:
+  - .loli files (raw LoliProfiler capture, auto-converted by MCP server)
+  - .txt snapshot files from `LoliProfilerCLI --dump`
+  - .txt diff files from `LoliProfilerCLI --compare`
 
 Usage:
-    # Analyze a heap snapshot
+    # Analyze a raw .loli capture
+    python analyze_heap.py snapshot.loli --no-source --model glm-5.1-ioa
+
+    # Analyze a pre-converted .txt snapshot
     python analyze_heap.py snapshot.txt --repo /path/to/source -o report.md
 
     # Specify model via CodeBuddy
@@ -57,7 +61,11 @@ def _format_duration(seconds: float) -> str:
 
 
 def detect_file_mode(data_file: str) -> str:
-    """Detect whether a heap data file is a diff or snapshot."""
+    """Detect whether a heap data file is a diff or snapshot.
+    .loli files are always raw snapshots (diffs come from --compare as .txt).
+    """
+    if data_file.lower().endswith('.loli'):
+        return 'snapshot'
     with open(data_file, 'r', encoding='utf-8') as f:
         for line in f:
             if 'Profile Report' in line:
@@ -918,13 +926,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python analyze_heap.py snapshot.loli --no-source --model glm-5.1-ioa
   python analyze_heap.py snapshot.txt --repo /path/to/source
   python analyze_heap.py snapshot.txt --no-source --model gpt-5.5
   python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0 -o report.html
         """
     )
 
-    parser.add_argument('data_file', help='Path to LoliProfilerCLI output file')
+    parser.add_argument('data_file',
+                        help='Path to heap data file (.loli or .txt from LoliProfilerCLI)')
     parser.add_argument('--repo', help='Path to source code repo')
     parser.add_argument('--base-repo', help='Path to baseline source code repo')
     parser.add_argument('--target-repo', help='Path to comparison source code repo')
