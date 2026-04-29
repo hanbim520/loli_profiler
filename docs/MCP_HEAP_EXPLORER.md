@@ -2,12 +2,13 @@
 
 ## Overview
 
-The MCP (Model Context Protocol) Heap Explorer provides an interactive way to analyze LoliProfiler heap data files using Claude Code. It supports two file formats:
+The MCP (Model Context Protocol) Heap Explorer provides an interactive way to analyze LoliProfiler heap data files using an LLM CLI (CodeBuddy or Claude Code). It supports three file formats:
 
-- **Diff files** from `LoliProfilerCLI --compare` — two-profile comparison showing memory growth/shrinkage
-- **Snapshot files** from `LoliProfilerCLI --dump` — single-profile export showing absolute memory distribution
+- **`.loli` files** — raw LoliProfiler capture files, auto-converted by the MCP server
+- **`.txt` snapshot files** from `LoliProfilerCLI --dump` — single-profile export showing absolute memory distribution
+- **`.txt` diff files** from `LoliProfilerCLI --compare` — two-profile comparison showing memory growth/shrinkage
 
-Instead of dumping the entire file content (often 12MB+ for diffs, or 100MB+ for snapshots) into a single prompt, it loads the data into an in-memory tree and exposes query tools that Claude can call interactively.
+Instead of dumping the entire file content (often 12MB+ for diffs, or 100MB+ for snapshots) into a single prompt, it loads the data into an in-memory tree and exposes query tools that the LLM can call interactively.
 
 ![](images/heap_callstack_mcp.png)
 
@@ -15,8 +16,10 @@ This approach reduces context usage from megabytes to ~10-20KB of focused, on-de
 
 ### How It Works
 
+Manual explorering.
+
 ```
-data file (diff.txt or snapshot.txt)
+data file (.loli, diff.txt, or snapshot.txt)
     |
     v
 MCP Server (heap_explorer_server.py)
@@ -24,12 +27,32 @@ MCP Server (heap_explorer_server.py)
     |  Loads into indexed in-memory tree
     |  Exposes 7 query tools via stdio
     v
-Claude Code
+Interactive LLM Interface
     |  Calls load_file() -> loads data (if not pre-loaded)
     |  Calls get_summary() -> understands situation
     |  Calls get_top_allocations() -> finds hotspots
     |  Calls get_children() / get_call_path() -> drills down
     |  Greps/Reads source code -> understands implementation
+```
+
+Automatic report generation.
+
+```
+data file (.loli, diff.txt, or snapshot.txt)
+    |
+    v
+MCP Server (heap_explorer_server.py)
+    |  Auto-detects format (diff vs snapshot)
+    |  .loli files auto-converted to snapshot format
+    |  Loads into indexed in-memory tree
+    |  Exposes 7 query tools via stdio
+    v
+LLM CLI (CodeBuddy / Claude Code)
+    |  Phase 1+2: Walker sub-agent loads data & discovers thread-grouped hotspots
+    |  Phase 3: Per-hotspot sub-agents do deep analysis, each writes result_<id>.md
+    v
+Python harness (analyze_heap.py)
+    |  Assembles result files into final report
     v
 Analysis Report (markdown/HTML)
 ```
@@ -84,23 +107,32 @@ You can also switch files mid-session — calling `load_file` again replaces the
 
 ### 2. Automated Batch Mode (analyze_heap.py)
 
-For CI/CD or scripted analysis, use `analyze_heap.py` which launches Claude Code as a subprocess with the MCP server pre-configured:
+For CI/CD or scripted analysis, use `analyze_heap.py` which launches an LLM CLI as a subprocess with the MCP server pre-configured. The script uses a **3-phase pipeline** architecture:
+
+- **Phase 1+2**: A "walker" sub-agent loads the heap data, walks the call tree, and discovers thread-grouped hotspots using a structural walk algorithm (pass-through/fan-out detection with UE4 thread pattern hints).
+- **Phase 3**: Per-hotspot sub-agents perform deep analysis, each writing a `result_<node_id>.md` file.
+- **Report Assembly**: The Python harness deterministically sorts and combines hotspot result files into the final report (the LLM does not write the report directly).
+
+The default LLM CLI is **CodeBuddy** (`codebuddy` or `cbc`), which supports multiple models (GPT, Gemini, Claude, etc.) via the `--model` flag. Claude CLI (`claude-internal` / `claude`) is kept as a fallback.
 
 ```bash
-# Analyze a diff (same codebase for both profiles)
-python analyze_heap.py diff.txt --repo /path/to/game/source -o report.md
+# Analyze a raw .loli capture (no source needed)
+python analyze_heap.py snapshot.loli --no-source --model glm-5.1-ioa
 
-# Analyze a heap snapshot
+# Analyze a pre-converted .txt snapshot with source code
 python analyze_heap.py snapshot.txt --repo /path/to/game/source -o report.md
 
-# HTML output
-python analyze_heap.py diff.txt --repo /path/to/game/source -o report.html
+# Specify model via CodeBuddy
+python analyze_heap.py snapshot.txt --no-source --model gpt-5.5
+
+# HTML output with custom minimum size threshold
+python analyze_heap.py diff.txt --repo /path/to/game/source --min-size 1.0 -o report.html
 
 # Different repos for baseline vs comparison (diff only)
 python analyze_heap.py diff.txt --base-repo /path/to/v1 --target-repo /path/to/v2
 
-# Custom minimum size threshold
-python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0
+# Dry run — print the prompt without executing
+python analyze_heap.py snapshot.txt --repo /path/to/source --dry-run
 ```
 
 ## MCP Tools Reference
@@ -284,43 +316,55 @@ python analyze_heap.py <data_file> [options]
 
 | Argument | Description |
 |----------|-------------|
-| `data_file` | Path to LoliProfilerCLI output file (diff from `--compare`, or snapshot from `--dump`) |
+| `data_file` | Path to heap data file (`.loli` raw capture, or `.txt` from `LoliProfilerCLI --compare` / `--dump`) |
 
-### Repository Options (one required)
+### Repository Options (one required, unless `--no-source`)
 
 | Option | Description |
 |--------|-------------|
 | `--repo <path>` | Source code repo (used for both baseline and comparison) |
 | `--base-repo <path>` | Baseline version source code repo (diff only) |
 | `--target-repo <path>` | Comparison version source code repo (diff only) |
+| `--no-source` | Skip source code grep; reason from function names only |
 
 ### Optional Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-o, --output <path>` | auto-generated .md | Output report file (.md or .html) |
-| `--min-size <MB>` | 2.0 | Minimum allocation size threshold in MB |
+| `--min-size <MB>` | 10.0 | Minimum allocation size threshold in MB |
 | `-t, --timeout <seconds>` | 1800 | Analysis timeout in seconds |
+| `--model <name>` | *(CLI default)* | Model to use (e.g. `gpt-5.5`, `claude-opus-4.6`, `gemini-3.1-pro`, `glm-5.1-ioa`). Passed to CLI via `--model` flag. |
+| `--dry-run` | — | Print the prompt and exit without running |
+| `--worklogs` | — | Enable verbose debug worklogs (~500-700 extra tokens/agent) |
 
 ## Architecture
 
 ```
 analyze_heap.py
   |
-  |-- Detects file mode (diff vs snapshot)
+  |-- Detects file mode (.loli → snapshot; .txt → auto-detect diff vs snapshot)
+  |-- Creates worklog directory (<output_basename>.worklogs/)
   |-- Writes temp .mcp.json config
-  |-- Launches: claude -p --mcp-config <config>
+  |-- Launches: <cli> -p --mcp-config <config> [--model <model>]
+  |     |        (cli = codebuddy/cbc, fallback: claude-internal/claude)
   |     |
-  |     |-- Claude starts MCP server as child process:
-  |     |     heap_explorer_server.py --file data.txt
+  |     |-- LLM starts MCP server as child process:
+  |     |     heap_explorer_server.py (loads data via load_file() tool)
   |     |       |
   |     |       |-- tree_model.py auto-detects format and loads data
   |     |       |-- Exposes 7 tools via FastMCP (stdio)
   |     |
-  |     |-- Claude calls MCP tools interactively
-  |     |-- Claude searches source code (Grep/Read)
-  |     |-- Claude writes report to output file
+  |     |-- Phase 1+2: Walker sub-agent explores tree, finds thread-grouped hotspots
+  |     |     Writes phase12_result.txt to worklog dir
+  |     |
+  |     |-- Phase 3: Per-hotspot sub-agents do deep analysis
+  |     |     Each writes result_<node_id>.md to worklog dir
+  |     |
+  |     |-- LLM exits after all sub-agents complete
   |
+  |-- Python harness assembles result files into final report
+  |-- Session diagnostics on failure (finds transcript, extracts model/tool stats)
   |-- Optionally converts .md to .html
 ```
 
@@ -331,7 +375,7 @@ mcp_server/
   __init__.py                  # Package marker
   tree_model.py                # Data model + query engine (~400 lines)
   heap_explorer_server.py      # MCP server with 7 tools (~170 lines)
-analyze_heap.py                # Batch automation script (~400 lines)
+analyze_heap.py                # Batch automation script with 3-phase pipeline (~1000 lines)
 .mcp.json                     # Project-scoped MCP config (no --file needed)
 requirements.txt               # mcp[cli]>=1.0.0
 ```
@@ -357,6 +401,13 @@ requirements.txt               # mcp[cli]>=1.0.0
 
 ## End-to-End Examples
 
+### Raw .loli Capture (No Source)
+
+```bash
+# Analyze directly from a .loli file without source code
+python analyze_heap.py snapshot.loli --no-source --model glm-5.1-ioa -o report.md
+```
+
 ### Diff Analysis
 
 ```bash
@@ -379,7 +430,22 @@ python analyze_heap.py snapshot.txt --repo /path/to/game/source -o report.md
 
 ### Review the report
 
-The report is written in Chinese markdown with function names in English, including call stacks, source code analysis, and optimization suggestions. For diff files, the report focuses on memory growth reasons; for snapshot files, it focuses on memory distribution and the largest allocation hotspots.
+The report is assembled by the Python harness from per-hotspot result files, written in Chinese markdown with function names in English. It includes a thread distribution table, per-hotspot call stacks, source code analysis, and optimization suggestions. For diff files, the report focuses on memory growth reasons; for snapshot files, it focuses on memory distribution and the largest allocation hotspots.
+
+### Output Structure
+
+After a successful run, you will find:
+
+```
+report.md                        # Final assembled report
+report.worklogs/                 # Working directory used by sub-agents
+  phase12_result.txt             # Walker output (thread/hotspot discovery)
+  result_123.md                  # Deep analysis for hotspot node 123
+  result_456.md                  # Deep analysis for hotspot node 456
+  ...
+  phase12_walker.md              # (only with --worklogs) Debug trace
+  phase3_123_FunctionName.md     # (only with --worklogs) Debug trace
+```
 
 ## Troubleshooting
 
@@ -390,9 +456,9 @@ Install the MCP SDK:
 pip install "mcp[cli]>=1.0.0"
 ```
 
-### "claude command not found"
+### "No supported CLI found"
 
-Ensure Claude CLI (`claude` or `claude-internal`) is installed and in your PATH.
+Ensure CodeBuddy (`codebuddy` or `cbc`) is installed and in your PATH. Claude CLI (`claude-internal` / `claude`) is accepted as a fallback but is no longer the default.
 
 ### MCP server not connecting
 
@@ -403,6 +469,14 @@ python mcp_server/tree_model.py snapshot.txt
 ```
 
 Expected output: `Roots: <N>, Total nodes: <M>` followed by summary stats. If this fails, check that the file is a valid `LoliProfilerCLI --compare` or `--dump` output.
+
+### Analysis failed or timed out
+
+When the LLM process exits with an error or times out, the harness:
+1. Prints session diagnostics (model used, total tool calls, last tool call, last assistant text) by inspecting the session transcript (`.jsonl`).
+2. Attempts **partial report assembly** from whatever `result_*.md` files were produced. This means you may still get a usable (though incomplete) report.
+
+Use `--worklogs` to enable per-agent debug traces for deeper investigation.
 
 ### Large files
 
