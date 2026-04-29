@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Automated heap analysis using MCP server + Claude Code.
+Automated heap analysis using MCP server + LLM CLI (CodeBuddy / Claude Code).
 
 Instead of dumping the entire data file (potentially hundreds of thousands of
-lines) into Claude's prompt, this script launches an MCP server that loads the
-data and exposes query tools. Claude interactively explores the heap data,
+lines) into the LLM's prompt, this script launches an MCP server that loads the
+data and exposes query tools. The LLM interactively explores the heap data,
 searches source code, and writes a report — with only ~10-20KB of focused data
 entering the context window.
 
@@ -13,30 +13,26 @@ Supports both file formats:
   - Snapshot files from `LoliProfilerCLI --dump` (single-profile export)
 
 Usage:
-    # Analyze a diff file
-    python analyze_heap.py diff.txt --repo /path/to/source -o report.md
-
-    # Analyze a snapshot file
+    # Analyze a heap snapshot
     python analyze_heap.py snapshot.txt --repo /path/to/source -o report.md
 
-    # HTML output
-    python analyze_heap.py diff.txt --repo /path/to/source -o report.html
+    # Specify model via CodeBuddy
+    python analyze_heap.py snapshot.txt --no-source --model gpt-5.5
 
-    # Different repos for baseline/comparison (diff only)
-    python analyze_heap.py diff.txt --base-repo /v1 --target-repo /v2
-
-    # Custom minimum size threshold
-    python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0
+    # HTML output with custom threshold
+    python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0 -o report.html
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 from datetime import datetime
 
 # Import markdown to HTML converter
@@ -61,29 +57,35 @@ def _format_duration(seconds: float) -> str:
 
 
 def detect_file_mode(data_file: str) -> str:
-    """Detect whether a heap data file is a diff or snapshot.
-
-    Checks the first few lines for the report title to determine the format.
-    Returns 'snapshot' or 'diff'.
-    """
+    """Detect whether a heap data file is a diff or snapshot."""
     with open(data_file, 'r', encoding='utf-8') as f:
         for line in f:
             if 'Profile Report' in line:
                 return 'snapshot'
             if 'Comparison Report' in line:
                 return 'diff'
-            # Stop scanning after the first non-blank, non-=== line
             if line.strip() and not line.strip().startswith('==='):
                 break
-    return 'diff'  # default to diff for backward compatibility
+    return 'diff'
 
 
-def find_claude_command() -> str:
-    """Find the claude CLI command."""
-    for cmd in ('claude-internal', 'claude'):
+def find_cli_command() -> str:
+    """Find the CLI command to use for analysis.
+
+    Search order:
+      1. codebuddy / cbc  — supports many models (GPT, Gemini, Claude, etc.)
+      2. claude-internal / claude — kept as fallback but not actively used
+    """
+    for cmd in ('codebuddy', 'cbc'):
         path = shutil.which(cmd)
         if path:
             return path
+    # Fallback to claude-internal / claude — kept for environments without CodeBuddy
+    # but not the primary path. These CLIs don't support --model.
+    # for cmd in ('claude-internal', 'claude'):
+    #     path = shutil.which(cmd)
+    #     if path:
+    #         return path
     return ""
 
 
@@ -92,283 +94,380 @@ def build_prompt(output_file: str,
                  target_repo: str,
                  min_size_mb: float,
                  mode: str = "diff",
-                 data_file: str = "") -> str:
-    """Build the analysis prompt for Claude.
+                 data_file: str = "",
+                 no_source: bool = False,
+                 worklog_dir: str = "",
+                 worklogs_enabled: bool = False) -> str:
+    """Build the analysis prompt for the LLM.
 
-    Uses a single template for both snapshot and diff modes, with only
-    the title, header rows, and source section varying.
+    The prompt drives a 3-phase pipeline where the LLM does ALL the work:
+      Phase 1+2: Walker sub-agent explores the heap tree via MCP tools
+      Phase 3:   Per-hotspot sub-agents do deep analysis, each writes result_<id>.md
+      (Report assembly is done by the Python harness after the LLM exits)
+
+    This lets the LLM reason about the data like a human engineer: adapting
+    its walk depth, noticing patterns, and making judgment calls.
     """
-    same_repo = os.path.normpath(base_repo) == os.path.normpath(target_repo)
+    # Normalize repos when running without source
+    if no_source:
+        base_repo = base_repo or ""
+        target_repo = target_repo or base_repo
 
-    # --- Mode-specific bits (kept minimal) ---
+    same_repo = os.path.normpath(base_repo or "") == os.path.normpath(target_repo or "")
+
+    # --- Mode-specific bits ---
     if mode == "snapshot":
         report_title = "内存快照分析报告"
-        header_rows = f"| 代码版本 | {os.path.basename(base_repo)} |"
-        source_section = f"Source code repository: {base_repo}" if base_repo else "No source code repository provided."
-        source_repo = base_repo
+        base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+        header_rows = f"| 代码版本 | {base_label} |"
+        if no_source:
+            source_section = (
+                "No source code repository is available. Do NOT call Grep or Read on any "
+                "source tree. Reason about each hotspot using generic knowledge: Unreal "
+                "Engine 4 internals, common third-party libraries, and standard C/C++ "
+                "runtime patterns."
+            )
+        else:
+            source_section = (
+                f"Source code repository: {base_repo}" if base_repo
+                else "No source code repository provided."
+            )
     else:
         report_title = "内存对比分析报告"
+        base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+        target_label = os.path.basename(target_repo) if target_repo else "N/A (no source)"
         header_rows = (
-            f"| 基线版本 | {os.path.basename(base_repo)} |\n"
-            f"| 对比版本 | {os.path.basename(target_repo)} |"
+            f"| 基线版本 | {base_label} |\n"
+            f"| 对比版本 | {target_label} |"
         )
-        if same_repo:
+        if no_source:
+            source_section = (
+                "No source code repository is available for either profile. Do NOT call "
+                "Grep or Read on any source tree. Reason about each hotspot using generic "
+                "knowledge: Unreal Engine 4 internals, common third-party libraries, and "
+                "standard C/C++ runtime patterns."
+            )
+        elif same_repo:
             source_section = f"""Source code repository: {base_repo}
 The two profiles are from different runs/builds of the same codebase."""
         else:
             source_section = f"""Baseline source code: {base_repo}
 Comparison source code: {target_repo}
 The profiles are from different versions. You can diff files between repos."""
-        source_repo = target_repo if os.path.isdir(target_repo) else base_repo
+        source_repo = target_repo if target_repo and os.path.isdir(target_repo) else base_repo
 
-    source_grep_instruction = (
-        f'Use Grep and Read tools to search the source repository at {source_repo} '
-        'for the function name. Analyze: what data structures are allocated, '
-        'buffer sizes, container growth, caching behavior.'
-        if base_repo else 'No source repo — skip source code analysis.'
-    )
+    if no_source:
+        source_grep_instruction = (
+            "No source repo available — DO NOT use Grep or Read to search source code. "
+            "Skip step 2 and go directly to step 3 (composition via get_children). "
+            "Reason about the hotspot using general knowledge of Unreal Engine 4, "
+            "the Unreal rendering pipeline, common third-party libraries, and "
+            "standard C/C++ runtime."
+        )
+    elif base_repo:
+        source_grep_instruction = (
+            f"Source code repo available at {source_repo}. GREP FIRST, then read:\n"
+            "   a. Use Grep to locate the function (pattern like 'ClassName::MethodName' "
+            "      or the bare method signature).\n"
+            "   b. Use Read on the most promising file(s) to understand what data "
+            "      structures are allocated, buffer sizes, container growth, caching "
+            "      behavior.\n"
+            "   c. Record the file:line in CODE_LOCATION of your return."
+        )
+    else:
+        source_grep_instruction = (
+            "No source repo configured — skip source code analysis. Go directly "
+            "to step 3 (composition via get_children)."
+        )
 
-    return f"""You are a memory analysis agent. Analyze a LoliProfiler {report_title} using the loli-heap MCP tools,
-then produce a structured Chinese-language report. Follow the phases below EXACTLY in order.
-Do NOT skip phases. Do NOT reorder phases.
+    # ── Build conditional prompt fragments for worklogs ────────────────
+    if worklogs_enabled:
+        worklog_description = (
+            f"WORKLOG DIRECTORY (already created): {worklog_dir}\n"
+            "When --worklogs is enabled, sub-agents write debug trace files here."
+        )
+        walker_worklog_instruction = (
+            f"WORKLOG — FIRST ACTION:\n"
+            f"Use the Write tool to create: {worklog_dir}/phase12_walker.md\n"
+            "Initial content:\n"
+            "    # Phase 1+2 worklog — walker\n"
+            "    ## Tool Calls\n"
+            "    ## Result\n"
+            "Append one bullet under \"## Tool Calls\" after every tool call you make.\n"
+            "Append THREADS_AND_HOTSPOTS to \"## Result\" before returning."
+        )
+        phase3_worklog_instruction = (
+            "    WORKLOG — WRITE THIS BEFORE OTHER TOOL CALLS:\n"
+            "    Use the Write tool to create:\n"
+            f"        {worklog_dir}/phase3_[node_id]_[sanitized_function_name].md\n"
+            "    (sanitize: replace non-[A-Za-z0-9_.-] with \"_\", max 60 chars)\n"
+            "    Initial content:\n"
+            "        # Phase 3 worklog — [function_name] (node_id=[node_id], size=[X.X] MB)\n"
+            "        ## Tool Calls\n"
+            "        ## Final output\n"
+            "    Append one bullet under \"## Tool Calls\" after each tool call.\n"
+        )
+    else:
+        worklog_description = ""
+        walker_worklog_instruction = ""
+        phase3_worklog_instruction = ""
+
+    return f"""You are a memory analysis agent. Analyze a LoliProfiler {report_title} using
+the loli-heap MCP tools. Follow the phases below EXACTLY in order.
 
 {source_section}
 
+{worklog_description}
+
+RESULT DIRECTORY (already created): {worklog_dir}
+Phase 3 sub-agents MUST write their analysis to result_<node_id>.md files here.
+The Python harness will assemble these into the final report after you finish.
+
 ═══════════════════════════════════════════════════════════════
-PHASE 1: DATA LOADING & THREAD DISCOVERY (you do this yourself)
+PHASE 1+2: DATA LOADING AND THREAD-GROUPED HOTSPOT DISCOVERY (walker sub-agent)
 ═══════════════════════════════════════════════════════════════
 
-Execute these tool calls in order:
+Dispatch ONE sub-agent (the "walker") via a single Agent tool-use block. The walker
+loads the heap data, walks the call tree, discovers thread-grouped hotspots, and
+returns structured data. You do NOT call any loli-heap MCP tools during this phase.
+
+Copy everything between the ── WALKER BRIEF ── markers below as the Agent prompt.
+All values are pre-filled — paste verbatim, do not modify any part:
+
+── WALKER BRIEF START ──────────────────────────────────────────
+You are a heap-profile tree walker. Load a LoliProfiler data file, walk the call
+tree from roots down, and return thread-grouped memory hotspots.
+
+{walker_worklog_instruction}
+
+Steps:
 
 1. load_file("{os.path.abspath(data_file)}")
-2. get_summary() — record the total size, total allocations, root count for the report header.
-3. search_function("Thread") — find all thread-related nodes.
-   From the results, identify **thread entry-point nodes**: nodes whose function name
-   contains a thread identifier (e.g. *Thread*::Run, *ThreadFunc, *ThreadMain,
-   *Thread*Proc, *thread_create*) AND whose size >= {min_size_mb} MB.
-   Record each thread's node_id, function name, and size.
-4. get_top_allocations(30, {min_size_mb}) — find the 30 largest allocation nodes.
-   For each result, check whether it is a descendant of any thread entry-point
-   found in step 3 (use get_call_path to check if uncertain).
-   Nodes NOT under any identified thread go into the "Others" group.
+2. get_summary() — record total size, total allocations, root count.
 
-After Phase 1 you must have:
-  - A list of thread entry-points: [(node_id, name, size_mb), ...]
-  - A list of "Others" nodes: [(node_id, name, size_mb), ...]
-  - Summary stats for the report header
+The walk algorithm is STRUCTURAL — no hard-coded function names. Two primitives:
 
-═══════════════════════════════════════════════════════════════
-PHASE 2: PER-THREAD HOTSPOT DISCOVERY (parallel sub-agents)
-═══════════════════════════════════════════════════════════════
+  A node is a PASS-THROUGH when it has exactly one child whose size is >= {min_size_mb}
+  MB and that child's size is >= 90% of the node's own size.
 
-For EACH thread entry-point from Phase 1, dispatch ONE sub-agent with the Agent tool.
-Also dispatch ONE sub-agent for the "Others" group.
-Launch ALL these sub-agents IN PARALLEL (multiple Agent tool calls in a single message).
+  A node is a FAN-OUT when it has two or more children with size >= {min_size_mb} MB.
 
-Each **thread sub-agent** receives this brief (fill in the bracketed values):
+KNOWN THREAD PATTERNS (hints — these are NOT hard-coded filters):
+  These function names commonly appear as thread entry points or intermediate wrappers
+  in UE4 iOS profiles. If you encounter them during the walk, they are likely
+  pass-through wrappers that lead to deeper hotspots. Do NOT record them as hotspots
+  or thread labels themselves — keep descending through them.
 
-    You are analyzing memory allocations under thread "[thread_name]" (node_id=[id], size=[X] MB)
-    in a LoliProfiler heap profile.
+  System / pthread layer (always pass-through):
+    thread_start, _pthread_start, start_wqthread, _pthread_wqthread,
+    start, main, UIApplicationMain, -[UIApplication _run], GSEventRunModal,
+    _CFRunLoopRunSpecificWithOptions, __CFRunLoopRun, libsystem_pthread!*
 
-    Execute these steps:
-    1. Call get_subtree([thread_node_id], 6) to see the call tree structure.
-    2. Starting from the largest children, call get_children recursively (up to 3 levels)
-       to find the hotspot leaf nodes — functions where memory actually accumulates.
-    3. Select the top 3-5 hotspots by size (each must be >= {min_size_mb} MB).
-       Skip generic wrappers (operator new, malloc, FMemory::Malloc, etc.) — pick
-       the deepest FUNCTIONAL-level function in each branch.
-    4. For each hotspot, call get_call_path(node_id) to get the full calling context.
+  UE thread dispatch (pass-through to actual thread entry):
+    FRunnableThreadPThread::_ThreadProc, FRunnableThreadPThread::Run,
+    __NSThread__start__, -[IOSAppDelegate MainAppThread:], Foundation!*
 
-    Return your results as EXACTLY this format (no other text):
-    THREAD: [thread_name]
-    THREAD_NODE_ID: [id]
-    THREAD_SIZE_MB: [size]
-    HOTSPOTS:
-    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
-    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
+  UE engine threads (use these as thread LABELS when the walk reaches them):
+    FAsyncLoadingThread::Run — asset loading thread
+    FRenderingThread::Run — rendering command thread
+    FTaskThreadAnyThread::Run — worker pool thread
+    FQueuedThread::Run — queued thread pool
+    FStatsThread::Run — stats collection
+    FChunkCacheWorker::Run — chunk cache
+
+  Game thread (use "GameThread" as label):
+    FAppEntry::Tick, FAppEntry::Init, FEngineLoop::Tick,
+    FEngineLoop::PreInitPostStartupScreen
+
+  Audio threads:
+    CAkThreadedBankMgr::BankThreadFunc — Wwise bank loading
+    CAkAudioThread::EventMgrThreadFunc — Wwise audio events
+
+  iOS dispatch / GCD (use the deepest meaningful function as label):
+    __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__,
+    _dispatch_main_queue_callback_4CF, _dispatch_main_queue_drain,
+    _dispatch_client_callout, _dispatch_call_block_and_release,
+    _dispatch_workloop_worker_thread, _dispatch_worker_thread2
+
+  These hints help you avoid recording "FRunnableThreadPThread::_ThreadProc" as a
+  thread when the real threads (FAsyncLoadingThread, FRenderingThread, etc.) are
+  one level deeper. The structural walk (pass-through/fan-out) is still the PRIMARY
+  logic — these hints supplement it.
+
+3. UNIFIED WALK — discovers threads AND hotspots in one pass.
+
+   The walk descends from each root through pass-through chains. The FIRST fan-out
+   from a root defines the thread labels. Subsequent fan-outs inside a thread
+   produce hotspots. There are no separate "thread discovery" and "hotspot discovery"
+   steps — they are the same algorithm, and MUST be executed in a single continuous
+   walk. Do NOT stop at thread boundaries.
+
+   Maintain a global hotspot list: [(thread_label, node_id, name, size_mb), ...]
+
+   def walk(node, thread_label):
+     # Terminal-allocator shortcut: if node's function name matches
+     #   malloc, _malloc*, realloc, _realloc*, operator new, operator delete,
+     #   *::Malloc, *::Realloc, *::Free, *::ResizeTo, *::ResizeGrow, FMemory::*,
+     #   FMalloc*::*, mmap, *_zone_malloc*, *_zone_realloc*
+     # then do NOT call get_children — return immediately.
+     if node.function_name matches a terminal-allocator pattern:
+       return
+
+     children = get_children(node)
+     BIG = children with size >= {min_size_mb} MB
+
+     if len(BIG) == 0:
+       label = thread_label or node.function_name
+       record(label, node)
+       return
+
+     if len(BIG) == 1 and BIG[0].size >= 0.9 * node.size:
+       # Pass-through: one dominant child. Keep descending.
+       walk(BIG[0], thread_label)
+       return
+
+     if len(BIG) == 1 and BIG[0].size < 0.9 * node.size:
+       # Node has meaningful own-size alongside one big child.
+       label = thread_label or node.function_name
+       record(label, node)
+       walk(BIG[0], label)
+       return
+
+     # len(BIG) >= 2  →  FAN-OUT.
+     if thread_label is None:
+       # FIRST fan-out from root. Each BIG child defines a thread.
+       for c in BIG:
+         walk(c, thread_label=c.function_name)
+     else:
+       # Fan-out inside a thread → sub-hotspots.
+       own = node.size - sum(c.size for c in BIG)
+       if own >= {min_size_mb}: record(thread_label, node)
+       for c in BIG:
+         walk(c, thread_label)
+
+   For each root whose size >= {min_size_mb} MB: call walk(root, thread_label=None).
+
+   CRITICAL: the walk MUST continue past thread boundaries into the actual hotspots.
+
+   Notes:
+     - If get_children errors with "output too large", fall back to
+       get_top_allocations(50, {min_size_mb}) filtered by get_call_path.
+     - Never call get_subtree with max_depth >= 5 on unknown-shape subtrees.
+     - DEDUP: if an existing hotspot is an ancestor/descendant of a new one,
+       keep only the deeper (more specific) node.
+     - Cap total recorded hotspots at 25.
+
+4. Return EXACTLY this format (no other text before or after):
+
+SUMMARY_STATS:
+total_size: [from get_summary, e.g. "1.76 GB"]
+total_allocs: [from get_summary, e.g. "489,493"]
+root_count: [root count]
+thread_count: [number of unique thread labels]
+
+THREADS_AND_HOTSPOTS:
+  Thread: <thread_label> (<sum of hotspot sizes> MB)
+    - [<node_id>] <function_name>  <size_mb> MB
+    ...
+  Thread: <next_thread> (<sum> MB)
     ...
 
-The **"Others" sub-agent** receives this brief:
+Sort threads by summed hotspot size descending; hotspots within thread by size descending.
 
-    You are analyzing large memory allocations that are NOT under any identified thread.
-    The following nodes were identified as "Others":
-    [list each node_id, name, size_mb]
+SELF-CHECK: if ANY thread has only ONE hotspot whose size equals the entire thread,
+the walk stopped too early. Call get_children on that node and continue descending.
+── WALKER BRIEF END ────────────────────────────────────────────
 
-    For each node (up to 10):
-    1. Call get_call_path(node_id) to see its full context.
-    2. Call get_children(node_id) to see sub-allocations.
-    3. Determine the top 3-5 hotspots across all "Others" nodes (>= {min_size_mb} MB).
-       Skip generic wrappers — pick the deepest functional-level function.
+After the walker returns, extract SUMMARY_STATS and THREADS_AND_HOTSPOTS from its
+response. Keep both in context — you will use them to drive Phase 3 dispatch.
 
-    Return your results as EXACTLY this format:
-    THREAD: Others
-    THREAD_NODE_ID: N/A
-    THREAD_SIZE_MB: [total]
-    HOTSPOTS:
-    - node_id: [id] | function: [name] | size_mb: [X.X] | call_path: [root > ... > func]
-    ...
+Also: use the Write tool to save the walker's output to:
+    {worklog_dir}/phase12_result.txt
+This lets the Python harness read it for report assembly.
+
 
 ═══════════════════════════════════════════════════════════════
-PHASE 3: PER-HOTSPOT DEEP ANALYSIS (parallel sub-agents)
+PHASE 3: PER-HOTSPOT DEEP ANALYSIS (sub-agents writing result files)
 ═══════════════════════════════════════════════════════════════
 
-Collect ALL hotspots from ALL Phase 2 sub-agents. For EACH hotspot, dispatch a sub-agent.
-Launch ALL these sub-agents IN PARALLEL (multiple Agent tool calls in a single message).
+Each hotspot from the walker's THREADS_AND_HOTSPOTS gets one deep-analysis sub-agent.
+Each sub-agent writes a self-contained markdown section to a result file.
 
-Each **hotspot sub-agent** receives this brief:
+DISPATCH RULE:
+  For each hotspot, dispatch ONE Agent tool-use block. Try to group multiple Agent
+  dispatches in a SINGLE assistant message for parallelism.
+
+Each **hotspot sub-agent** receives this brief (fill in the bracketed values):
 
     You are performing deep analysis on a memory hotspot in a LoliProfiler heap profile.
     Function: [function_name]
     Node ID: [node_id]
     Size: [X.X] MB
     Thread context: [thread_name]
-    Call path: [call_path_summary from Phase 2]
 
-    Execute these steps:
-    1. Call get_call_path([node_id]) to get the full annotated call stack.
-    2. Call get_children([node_id]) to see what sub-allocations exist below.
-    3. {source_grep_instruction}
+{phase3_worklog_instruction}
+    Exploration steps:
+    1. Call get_call_path([node_id]) to confirm the full calling context.
+    2. {source_grep_instruction}
+    3. Call get_children([node_id]) to see the COMPOSITION — what specifically accounts
+       for the [X.X] MB? If any child is >= 30% of the hotspot size, call get_children
+       on that child too (one level deeper).
+    4. If get_children errors with "output too large", use get_top_allocations as fallback.
 
-    Return your analysis as EXACTLY this format:
+    RESULT FILE — MANDATORY:
+    Use the Write tool to save your analysis to:
+        {worklog_dir}/result_[node_id].md
 
-    HOTSPOT_ANALYSIS:
+    The file MUST have this exact format (YAML frontmatter + markdown body):
+
+    ---
     function: [full function name]
     node_id: [id]
     size_mb: [X.X]
     thread: [thread_name]
+    ---
 
-    CALL_STACK (use tree format with └── and indentation, include size at each frame):
+    ### [function_name] — [X.X] MB
+
+    **完整调用栈:**
+    ```
     FunctionRoot (XX.X MB)
     └── ChildFunction (XX.X MB)
-        └── GrandchildFunction (XX.X MB)
-            └── ... down to the hotspot function
+        └── ... down to the hotspot function
+    ```
 
-    CODE_LOCATION: [file:line if found, or "N/A"]
+    **代码位置:** [file:line or N/A]
 
-    SOURCE_ANALYSIS:
-    [2-3 sentences: what this code does, what data structures it allocates]
+    **源码分析:** [2-3 sentences in Chinese: what this code does, what it allocates]
 
-    ROOT_CAUSE:
-    [2-3 sentences: why this allocation is large]
+    **内存占用原因:** [2-3 sentences in Chinese: why this allocation is large,
+    reference specific children from get_children]
 
-    OPTIMIZATION:
-    [2-3 sentences: specific, actionable optimization suggestions]
+    **优化建议:** [2-3 sentences in Chinese: specific, actionable optimization suggestions]
 
-═══════════════════════════════════════════════════════════════
-PHASE 4: REPORT ASSEMBLY (you do this yourself)
-═══════════════════════════════════════════════════════════════
+    ---
 
-Gather ALL results from Phase 2 and Phase 3. Assemble the final report using
-EXACTLY this template. Do not add extra sections. Do not remove sections.
-Fill in all [...] placeholders with actual data.
+    After writing the result file, return a brief confirmation:
+    "Result written: result_[node_id].md"
 
----BEGIN TEMPLATE---
+After ALL Phase 3 sub-agents have returned, confirm they all wrote their result files.
+Then return: "All phases complete. Result files in {worklog_dir}"
 
-# {report_title}
-
-| 项目 | 值 |
-|------|-----|
-| 生成时间 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |
-| 分析工具 | LoliProfiler + Claude Code |
-{header_rows}
-
-## 内存分布概况
-
-| 指标 | 值 |
-|------|-----|
-| 总内存 | [total size from get_summary] |
-| 总分配次数 | [total allocs from get_summary] |
-| 根节点数 | [root count] |
-| 识别线程数 | [number of threads found in Phase 1] |
-
-[1-2 sentences summarizing the overall memory distribution across threads]
-
-## 线程内存分布
-
-| 线程 | 内存占用 | 占比 |
-|------|---------|------|
-| [Thread 1 name] | [X.X MB] | [X.X%] |
-| [Thread 2 name] | [X.X MB] | [X.X%] |
-| ... | ... | ... |
-| Others | [X.X MB] | [X.X%] |
-
-## [Thread 1 name] ([X.X MB])
-
-### [1] [函数名] — [X.X MB]
-
-**完整调用栈:**
-```
-FunctionRoot (XX.X MB)
-└── ChildFunction (XX.X MB)
-    └── GrandchildFunction (XX.X MB)
-        └── HotspotFunction (XX.X MB)
-```
-
-**代码位置:** [file:line or N/A]
-
-**源码分析:** [from Phase 3 SOURCE_ANALYSIS]
-
-**内存占用原因:** [from Phase 3 ROOT_CAUSE]
-
-**优化建议:** [from Phase 3 OPTIMIZATION]
-
----
-
-(repeat for all hotspots in this thread, numbered sequentially, sorted by size descending)
-
-## [Thread 2 name] ([X.X MB])
-
-(same structure as above)
-
-## Others ([X.X MB])
-
-(same structure for non-thread hotspots)
-
-## 优化优先级建议
-
-| 优先级 | 函数 | 线程 | 内存占用 | 难度 | 建议 |
-|--------|------|------|---------|------|------|
-| 1 | [func] | [thread] | [X.X MB] | [高/中/低] | [one-line summary] |
-| 2 | ... | ... | ... | ... | ... |
-
-(list all hotspots ranked by impact, top priority first)
-
-## 总结
-
-[3-5 sentences: overall memory distribution patterns, key findings, top 3 recommendations]
-
-## 分析统计
-
-| 指标 | 值 |
-|------|-----|
-| 分析热点数 | [total hotspots analyzed across all threads] |
-| 识别线程数 | [number of threads found] |
-| 派遣子代理数 | [total sub-agents dispatched in Phase 2 + Phase 3] |
-| MCP 工具调用次数 | [estimated total loli-heap tool calls across all agents] |
-
----END TEMPLATE---
+The Python harness will assemble result files into the final report — you do NOT need
+to write the report yourself. Your job is done after Phase 3.
 
 IMPORTANT RULES:
 - Only analyze allocations >= {min_size_mb} MB.
 - This is READ-ONLY analysis. Do NOT modify any source code files.
-- Skip generic wrappers (operator new, malloc, FMemory::*, etc.) — drill to functional-level functions.
 - All prose in Chinese. All code/function names in English.
-- Sort threads by size descending. Sort hotspots within each thread by size descending.
-- The "分析统计" table MUST be the very last content in the file.
-  The harness will append a "总耗时" row to it. Ensure the table ends with a normal
-  table row followed by a newline. Do NOT put any text after the stats table.
-
-CRITICAL: Save the complete report to: {output_file}
-Use the Write tool to save it. After saving, confirm with: "Report saved to: {output_file}"
+- PHASE 1+2: dispatch ONE walker sub-agent. Copy the brief VERBATIM.
+- PHASE 3: dispatch one Agent per hotspot. Each writes result_<id>.md.
+- Do NOT write the final report — the harness does that from result files.
 """
 
 
 def build_mcp_config() -> dict:
-    """Build the MCP server configuration.
-
-    The server starts empty (no --file) so it connects to Claude instantly.
-    The prompt instructs Claude to call load_file() as the first step.
-    """
+    """Build the MCP server configuration."""
     server_script = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         'mcp_server', 'heap_explorer_server.py'
@@ -384,27 +483,282 @@ def build_mcp_config() -> dict:
     }
 
 
+def _worklog_dir_for(output_file: str) -> str:
+    """Compute the sibling worklog directory for a given report output path."""
+    base = output_file
+    for ext in ('.md', '.html', '.htm'):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    return os.path.abspath(base + '.worklogs')
+
+
+# ── Report assembly (runs after the LLM exits) ────────────────────────
+
+def _assemble_report(worklog_dir: str, output_file: str,
+                     report_title: str, header_rows: str,
+                     gen_time: str, start_time: str = "",
+                     duration_str: str = "",
+                     cli_name: str = "", model_name: str = "") -> bool:
+    """Read result files from worklog_dir and assemble the final report.
+
+    Each Phase 3 agent writes result_<node_id>.md with YAML frontmatter
+    (function, node_id, size_mb, thread) and a markdown body. The walker
+    writes phase12_result.txt with SUMMARY_STATS and THREADS_AND_HOTSPOTS.
+
+    Returns True if a report was assembled, False if no result files found.
+    """
+    # Read walker output
+    walker_path = os.path.join(worklog_dir, 'phase12_result.txt')
+    summary_stats = {}
+    if os.path.exists(walker_path):
+        with open(walker_path, 'r', encoding='utf-8') as f:
+            walker_text = f.read()
+        # Parse SUMMARY_STATS
+        for line in walker_text.split('\n'):
+            if ':' in line and not line.startswith('SUMMARY') and not line.startswith('THREAD'):
+                key, _, val = line.partition(':')
+                summary_stats[key.strip()] = val.strip()
+
+    # Read all result files
+    results = []
+    try:
+        for fname in os.listdir(worklog_dir):
+            if fname.startswith('result_') and fname.endswith('.md'):
+                fpath = os.path.join(worklog_dir, fname)
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                # Parse YAML frontmatter
+                meta = {}
+                body = content
+                fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)$', content, re.DOTALL)
+                if fm_match:
+                    for line in fm_match.group(1).split('\n'):
+                        if ':' in line:
+                            k, _, v = line.partition(':')
+                            meta[k.strip()] = v.strip()
+                    body = fm_match.group(2)
+                results.append({
+                    'meta': meta,
+                    'body': body.strip(),
+                    'file': fname,
+                })
+    except OSError:
+        pass
+
+    if not results:
+        return False
+
+    # Group by thread
+    threads = OrderedDict()
+    for r in results:
+        thread = r['meta'].get('thread', 'Unknown')
+        threads.setdefault(thread, []).append(r)
+
+    # Sort threads by total size descending
+    def _thread_size(items):
+        return sum(float(r['meta'].get('size_mb', 0)) for r in items)
+
+    sorted_threads = sorted(threads.items(), key=lambda t: _thread_size(t[1]), reverse=True)
+
+    # Sort hotspots within each thread by size descending
+    for thread_name, items in sorted_threads:
+        items.sort(key=lambda r: float(r['meta'].get('size_mb', 0)), reverse=True)
+
+    # Build report
+    lines = []
+    lines.append(f"# {report_title}\n")
+    lines.append("| 项目 | 值 |")
+    lines.append("|------|-----|")
+    if start_time:
+        lines.append(f"| 开始时间 | {start_time} |")
+    lines.append(f"| 生成时间 | {gen_time} |")
+    if duration_str:
+        lines.append(f"| 分析耗时 | {duration_str} |")
+    tool_label = "LoliProfiler + "
+    if cli_name and model_name:
+        tool_label += f"{cli_name} ({model_name})"
+    elif cli_name:
+        tool_label += cli_name
+    else:
+        tool_label += "LLM CLI"
+    lines.append(f"| 分析工具 | {tool_label} |")
+    lines.append(header_rows)
+    lines.append("")
+
+    # Compute totals up front
+    total_size = sum(_thread_size(items) for _, items in sorted_threads)
+    hotspot_num = sum(len(items) for _, items in sorted_threads)
+
+    # Summary stats (includes thread/hotspot counts — no separate 分析统计 section)
+    lines.append("## 内存分布概况\n")
+    lines.append("| 指标 | 值 |")
+    lines.append("|------|-----|")
+    lines.append(f"| 总内存 | {summary_stats.get('total_size', 'N/A')} |")
+    lines.append(f"| 总分配次数 | {summary_stats.get('total_allocs', 'N/A')} |")
+    lines.append(f"| 根节点数 | {summary_stats.get('root_count', 'N/A')} |")
+    lines.append(f"| 识别线程数 | {len(sorted_threads)} |")
+    lines.append(f"| 分析热点数 | {hotspot_num} |")
+    lines.append("")
+
+    # Thread distribution table
+    lines.append("## 线程内存分布\n")
+    lines.append("| 线程 | 内存占用 | 占比 |")
+    lines.append("|------|---------|------|")
+    for thread_name, items in sorted_threads:
+        ts = _thread_size(items)
+        pct = (ts / total_size * 100) if total_size > 0 else 0
+        lines.append(f"| {thread_name} | {ts:.2f} MB | {pct:.1f}% |")
+    lines.append("")
+
+    # Per-thread hotspot sections
+    for thread_name, items in sorted_threads:
+        ts = _thread_size(items)
+        lines.append(f"## {thread_name} ({ts:.2f} MB)\n")
+        for r in items:
+            lines.append(r['body'])
+            lines.append("")  # blank line between hotspots
+
+    report = "\n".join(lines)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(report)
+    return True
+
+
+# ── Session diagnostics ───────────────────────────────────────────────
+
+def _find_session_jsonl(cwd: str, started_after: float) -> str | None:
+    """Locate the session transcript for a run we just launched."""
+    home = os.path.expanduser('~')
+    # Try both .claude-internal and .codebuddy project dirs
+    for proj_root_name in ('.claude-internal', '.codebuddy'):
+        projects_root = os.path.join(home, proj_root_name, 'projects')
+        if not os.path.isdir(projects_root):
+            continue
+
+        abs_cwd = os.path.abspath(cwd)
+        drive, rest = os.path.splitdrive(abs_cwd)
+        drive = drive.rstrip(':')
+        slug = (drive + rest).replace('\\', '-').replace('/', '-').strip('-')
+
+        project_dir = os.path.join(projects_root, slug)
+        if os.path.isdir(project_dir):
+            candidates = []
+            for f in os.listdir(project_dir):
+                if f.endswith('.jsonl'):
+                    p = os.path.join(project_dir, f)
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if mt >= started_after:
+                        candidates.append((mt, p))
+            if candidates:
+                candidates.sort(reverse=True)
+                return candidates[0][1]
+    return None
+
+
+def _inspect_session(jsonl_path: str) -> dict:
+    """Extract diagnostics from a session transcript."""
+    model = None
+    tool_calls = 0
+    last_tool = None
+    last_assistant_text = ''
+    stopped_with = None
+
+    try:
+        with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                try:
+                    j = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = j.get('type')
+                if t == 'assistant':
+                    msg = j.get('message', {}) or {}
+                    if not model:
+                        m = msg.get('model')
+                        if m:
+                            model = m
+                    for c in msg.get('content', []) or []:
+                        if c.get('type') == 'tool_use':
+                            tool_calls += 1
+                            last_tool = (c.get('name', ''),
+                                         json.dumps(c.get('input', {}), ensure_ascii=False))
+                        elif c.get('type') == 'text':
+                            txt = c.get('text', '').strip()
+                            if txt:
+                                last_assistant_text = txt
+                elif t == 'attachment':
+                    att = j.get('attachment', {}) or {}
+                    if att.get('hookEvent') == 'Stop':
+                        stopped_with = 'Stop'
+    except OSError:
+        pass
+
+    return {
+        'model': model,
+        'tool_calls': tool_calls,
+        'last_tool': last_tool,
+        'last_assistant_text': last_assistant_text,
+        'stopped_with': stopped_with,
+    }
+
+
+def _format_diagnostics(diag: dict, jsonl_path: str | None) -> str:
+    """Human-readable diagnostics string for stderr on failure."""
+    lines = ['=' * 70, 'DIAGNOSTICS', '=' * 70]
+    lines.append(f"Model:               {diag.get('model') or '(unknown)'}")
+    lines.append(f"Total tool calls:    {diag.get('tool_calls')}")
+    lines.append(f"Stopped via hook:    {diag.get('stopped_with') or '(no)'}")
+    lt = diag.get('last_tool')
+    if lt:
+        name, args = lt
+        lines.append(f"Last tool call:      {name}({args[:200]})")
+    text = diag.get('last_assistant_text') or ''
+    if text:
+        preview = text[:500].replace('\r', ' ').replace('\n', ' <- ')
+        lines.append(f"Last assistant text: {preview}")
+    if jsonl_path:
+        lines.append(f"Full transcript:     {jsonl_path}")
+    lines.append('=' * 70)
+    return '\n'.join(lines)
+
+
+# ── Main analysis runner ──────────────────────────────────────────────
+
 def run_analysis(data_file: str,
                  base_repo: str,
                  target_repo: str,
                  output_file: str,
-                 min_size_mb: float = 2.0,
-                 timeout: int = 1800) -> bool:
-    """Run Claude with MCP server to analyze heap data.
+                 min_size_mb: float = 10.0,
+                 timeout: int = 1800,
+                 no_source: bool = False,
+                 worklogs_enabled: bool = False,
+                 model: str = "") -> bool:
+    """Run an LLM CLI with MCP server to analyze heap data.
 
-    Returns True on success, False otherwise.
+    The LLM does Phase 1+2 (walk) and Phase 3 (deep analysis).
+    The Python harness then assembles result files into the final report.
     """
-    claude_cmd = find_claude_command()
-    if not claude_cmd:
-        print("ERROR: 'claude-internal' or 'claude' command not found!", file=sys.stderr)
-        print("Please ensure Claude CLI is installed and in your PATH.", file=sys.stderr)
+    cli_cmd = find_cli_command()
+    if not cli_cmd:
+        print("ERROR: No supported CLI found (codebuddy, cbc)!", file=sys.stderr)
+        print("Install CodeBuddy: npm i -g @anthropic-ai/codebuddy", file=sys.stderr)
         return False
 
     mode = detect_file_mode(data_file)
-    print(f"Using Claude command: {claude_cmd}")
+    print(f"Using CLI: {cli_cmd}")
+    if model:
+        print(f"Model: {model}")
     print(f"Data file: {data_file} [mode: {mode}]")
 
-    # Write temporary MCP config
+    abs_output = os.path.abspath(output_file)
+    worklog_dir = _worklog_dir_for(abs_output)
+    os.makedirs(worklog_dir, exist_ok=True)
+    print(f"Worklog dir: {worklog_dir}")
+
     mcp_config = build_mcp_config()
     with tempfile.TemporaryDirectory(prefix='loli_mcp_') as tmp_dir:
         mcp_config_path = os.path.join(tmp_dir, '.mcp.json')
@@ -412,34 +766,41 @@ def run_analysis(data_file: str,
             json.dump(mcp_config, f, indent=2)
 
         print(f"MCP config: {mcp_config_path}")
-        print(f"MCP server: {mcp_config['mcpServers']['loli-heap']['args']}")
 
-        # Build prompt
-        abs_output = os.path.abspath(output_file)
-        prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb, mode=mode, data_file=data_file)
+        prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb,
+                              mode=mode, data_file=data_file, no_source=no_source,
+                              worklog_dir=worklog_dir,
+                              worklogs_enabled=worklogs_enabled)
 
         prompt_size_kb = len(prompt.encode('utf-8')) / 1024
-        print(f"Prompt size: {prompt_size_kb:.1f} KB (no data embedded — uses MCP tools)")
+        print(f"Prompt size: {prompt_size_kb:.1f} KB")
         print()
 
         try:
+            cwd = os.getcwd()
             if mode == "snapshot":
-                cwd = base_repo if os.path.isdir(base_repo) else os.getcwd()
+                if base_repo and os.path.isdir(base_repo):
+                    cwd = base_repo
             else:
-                cwd = target_repo if os.path.isdir(target_repo) else base_repo
+                if target_repo and os.path.isdir(target_repo):
+                    cwd = target_repo
+                elif base_repo and os.path.isdir(base_repo):
+                    cwd = base_repo
             is_windows = sys.platform.startswith('win')
 
-            # WARNING: --dangerously-skip-permissions allows Claude to execute
-            # arbitrary tools without user confirmation. This is required for
-            # batch/CI usage but should only be used in trusted environments.
+            cmd_args = [
+                cli_cmd, '-p',
+                '--verbose',
+                '--dangerously-skip-permissions',
+                '--mcp-config', mcp_config_path,
+            ]
+            if model:
+                cmd_args.extend(['--model', model])
+
             t_start = time.monotonic()
+            started_wall = time.time()
             result = subprocess.run(
-                [
-                    claude_cmd, '-p',
-                    '--verbose',
-                    '--dangerously-skip-permissions',
-                    '--mcp-config', mcp_config_path,
-                ],
+                cmd_args,
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -451,47 +812,98 @@ def run_analysis(data_file: str,
             )
             duration_sec = time.monotonic() - t_start
 
+            session_jsonl = _find_session_jsonl(cwd, started_wall - 5)
+            diag = _inspect_session(session_jsonl) if session_jsonl else {
+                'model': None, 'tool_calls': 0, 'last_tool': None,
+                'last_assistant_text': '', 'stopped_with': None,
+            }
+
             if result.returncode != 0:
-                print(f"Claude analysis failed (exit {result.returncode}):", file=sys.stderr)
+                print(f"Analysis failed (exit {result.returncode}):", file=sys.stderr)
                 if result.stderr:
                     print(result.stderr[:2000], file=sys.stderr)
-                return False
+                print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
+                # Still try to assemble whatever result files were produced
+                print("Attempting partial report assembly from result files...",
+                      file=sys.stderr)
 
-            # Check if Claude wrote the report
-            if os.path.exists(abs_output):
+            print(f"\nLLM phase duration: {_format_duration(duration_sec)}")
+
+            # List result files
+            try:
+                result_files = [f for f in os.listdir(worklog_dir)
+                                if f.startswith('result_') and f.endswith('.md')]
+                worklog_files = [f for f in os.listdir(worklog_dir)
+                                 if f.endswith('.md') and not f.startswith('result_')]
+            except OSError:
+                result_files = []
+                worklog_files = []
+            print(f"Result files: {len(result_files)}")
+            if worklog_files:
+                print(f"Debug worklogs: {len(worklog_files)} files")
+
+            # Assemble report from result files
+            if mode == "snapshot":
+                report_title = "内存快照分析报告"
+                base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+                header_rows = f"| 代码版本 | {base_label} |"
+            else:
+                report_title = "内存对比分析报告"
+                base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+                target_label = os.path.basename(target_repo) if target_repo else "N/A (no source)"
+                header_rows = (
+                    f"| 基线版本 | {base_label} |\n"
+                    f"| 对比版本 | {target_label} |"
+                )
+
+            gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            start_time_str = datetime.fromtimestamp(started_wall).strftime('%Y-%m-%d %H:%M:%S')
+            cli_basename = os.path.splitext(os.path.basename(cli_cmd))[0]
+            if _assemble_report(worklog_dir, abs_output, report_title,
+                                header_rows, gen_time,
+                                start_time=start_time_str,
+                                duration_str=_format_duration(duration_sec),
+                                cli_name=cli_basename,
+                                model_name=model):
                 with open(abs_output, 'r', encoding='utf-8') as f:
                     report = f.read()
-                print("ANALYSIS COMPLETE")
-                print(f"Report written by Claude to: {abs_output}")
-            elif result.stdout.strip():
-                # Fallback: save stdout
-                report = result.stdout.strip()
-                with open(abs_output, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                print("ANALYSIS COMPLETE")
-                print(f"Report written to: {abs_output}")
+                print(f"\nANALYSIS COMPLETE")
+                print(f"Report assembled from {len(result_files)} result files: {abs_output}")
+            elif os.path.exists(abs_output):
+                # LLM may have written the report directly (legacy behavior)
+                with open(abs_output, 'r', encoding='utf-8') as f:
+                    report = f.read()
+                print(f"\nANALYSIS COMPLETE")
+                print(f"Report written by LLM: {abs_output}")
             else:
-                print("Claude returned empty response", file=sys.stderr)
+                print("No result files and no report produced.", file=sys.stderr)
+                print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
                 return False
-
-            # Print timing to console
-            print(f"\nAnalysis duration: {_format_duration(duration_sec)}")
 
             # Preview
             print()
             print("Report preview:")
             print("-" * 80)
-            lines = report.split('\n')
-            for line in lines[:60]:
+            for line in report.split('\n')[:60]:
                 print(line)
-            if len(lines) > 60:
-                print(f"\n... ({len(lines) - 60} more lines in full report)")
+            if len(report.split('\n')) > 60:
+                print(f"\n... ({len(report.split(chr(10))) - 60} more lines)")
             print()
 
             return True
 
         except subprocess.TimeoutExpired:
             print(f"Analysis timed out after {timeout // 60} minutes", file=sys.stderr)
+            # Try partial assembly
+            gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if mode == "snapshot":
+                rt, hr = "内存快照分析报告", f"| 代码版本 | N/A |"
+            else:
+                rt, hr = "内存对比分析报告", "| 基线版本 | N/A |\n| 对比版本 | N/A |"
+            if _assemble_report(worklog_dir, abs_output, rt, hr, gen_time,
+                                cli_name=os.path.splitext(os.path.basename(cli_cmd))[0],
+                                model_name=model):
+                print(f"Partial report assembled from available result files: {abs_output}")
             return False
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -502,95 +914,108 @@ def run_analysis(data_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze LoliProfiler heap data (diff or snapshot) via MCP server + Claude AI',
+        description='Analyze LoliProfiler heap data via MCP server + LLM CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze a diff with same repo for both versions
-  python analyze_heap.py diff.txt --repo /path/to/game/source
-
-  # Analyze a heap snapshot
-  python analyze_heap.py snapshot.txt --repo /path/to/game/source
-
-  # Analyze with different repos for baseline and comparison
-  python analyze_heap.py diff.txt --base-repo /path/to/v1 --target-repo /path/to/v2
-
-  # HTML output with custom threshold
+  python analyze_heap.py snapshot.txt --repo /path/to/source
+  python analyze_heap.py snapshot.txt --no-source --model gpt-5.5
   python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0 -o report.html
         """
     )
 
-    parser.add_argument('data_file', help='Path to LoliProfilerCLI output file (diff from --compare, or snapshot from --dump)')
-    parser.add_argument('--repo',
-                        help='Path to source code repo (used for both baseline and comparison)')
-    parser.add_argument('--base-repo',
-                        help='Path to baseline version source code repo')
-    parser.add_argument('--target-repo',
-                        help='Path to comparison version source code repo')
-    parser.add_argument('--output', '-o',
-                        help='Output report file path (.md or .html, default: auto-generated .md)')
-    parser.add_argument('--min-size', type=float, default=2.0,
-                        help='Minimum allocation size threshold in MB (default: 2.0)')
+    parser.add_argument('data_file', help='Path to LoliProfilerCLI output file')
+    parser.add_argument('--repo', help='Path to source code repo')
+    parser.add_argument('--base-repo', help='Path to baseline source code repo')
+    parser.add_argument('--target-repo', help='Path to comparison source code repo')
+    parser.add_argument('--output', '-o', help='Output report file path (.md or .html)')
+    parser.add_argument('--min-size', type=float, default=10.0,
+                        help='Minimum allocation size in MB (default: 10.0)')
     parser.add_argument('--timeout', '-t', type=int, default=1800,
-                        help='Analysis timeout in seconds (default: 1800 = 30 minutes)')
+                        help='Analysis timeout in seconds (default: 1800)')
+    parser.add_argument('--no-source', action='store_true',
+                        help='Skip source grep; reason from function names only')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Print the prompt and exit without running')
+    parser.add_argument('--worklogs', action='store_true',
+                        help='Enable verbose debug worklogs (~500-700 extra tokens/agent)')
+    parser.add_argument('--model',
+                        help='Model to use (e.g. gpt-5.5, claude-opus-4.6, gemini-3.1-pro). '
+                             'Passed to CLI via --model flag.')
 
     args = parser.parse_args()
 
-    # Validate
     if not os.path.exists(args.data_file):
         print(f"Error: Data file not found: {args.data_file}", file=sys.stderr)
         return 1
 
-    if args.repo:
+    if args.no_source:
+        base_repo = args.repo or args.base_repo or ""
+        target_repo = args.repo or args.target_repo or base_repo
+        if base_repo and not os.path.exists(base_repo):
+            base_repo = ""
+        if target_repo and not os.path.exists(target_repo):
+            target_repo = ""
+    elif args.repo:
         base_repo = target_repo = args.repo
     elif args.base_repo and args.target_repo:
         base_repo = args.base_repo
         target_repo = args.target_repo
     else:
-        print("Error: Must specify either --repo or both --base-repo and --target-repo",
-              file=sys.stderr)
+        print("Error: Must specify --repo or both --base-repo/--target-repo "
+              "(or --no-source)", file=sys.stderr)
         return 1
 
-    if not os.path.exists(base_repo):
-        print(f"Error: Base repo path not found: {base_repo}", file=sys.stderr)
-        return 1
-    if not os.path.exists(target_repo):
-        print(f"Error: Target repo path not found: {target_repo}", file=sys.stderr)
-        return 1
+    if not args.no_source:
+        for label, path in [("Base repo", base_repo), ("Target repo", target_repo)]:
+            if not os.path.exists(path):
+                print(f"Error: {label} not found: {path}", file=sys.stderr)
+                return 1
 
-    # Output path
     output_file = args.output or f"memory_analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     output_file = os.path.abspath(output_file)
-
     output_html = output_file.lower().endswith('.html')
-    if output_html:
-        md_output_file = output_file[:-5] + '.md'
-    else:
-        md_output_file = output_file
+    md_output_file = output_file[:-5] + '.md' if output_html else output_file
 
-    # Run
+    if args.dry_run:
+        mode = detect_file_mode(args.data_file)
+        worklog_dir = _worklog_dir_for(os.path.abspath(md_output_file))
+        prompt = build_prompt(md_output_file, base_repo, target_repo, args.min_size,
+                              mode=mode, data_file=args.data_file,
+                              no_source=args.no_source, worklog_dir=worklog_dir,
+                              worklogs_enabled=args.worklogs)
+        cli_cmd = find_cli_command() or "<no CLI found>"
+        model_flag = f" --model {args.model}" if args.model else ""
+
+        print("=" * 80)
+        print("DRY RUN")
+        print("=" * 80)
+        print(f"CLI: {cli_cmd}{model_flag}")
+        print(f"Data: {args.data_file} [mode: {mode}]")
+        print(f"Min size: {args.min_size} MB | No source: {args.no_source}")
+        print(f"Output: {md_output_file}")
+        print(f"Prompt ({len(prompt.encode('utf-8')) / 1024:.1f} KB):")
+        print("-" * 80)
+        print(prompt)
+        return 0
+
     success = run_analysis(
-        args.data_file,
-        base_repo,
-        target_repo,
-        md_output_file,
-        min_size_mb=args.min_size,
-        timeout=args.timeout,
+        args.data_file, base_repo, target_repo, md_output_file,
+        min_size_mb=args.min_size, timeout=args.timeout,
+        no_source=args.no_source, worklogs_enabled=args.worklogs,
+        model=args.model or "",
     )
 
-    # HTML conversion
     if success and output_html:
         if HTML_CONVERSION_AVAILABLE:
             print("Converting markdown to HTML...")
             if convert_md_to_html(md_output_file, output_file):
-                print(f"HTML report written to: {output_file}")
+                print(f"HTML report: {output_file}")
             else:
                 print(f"Warning: HTML conversion failed, markdown at: {md_output_file}",
                       file=sys.stderr)
         else:
-            print(f"Warning: HTML conversion requested but markdown_to_html.py not available",
-                  file=sys.stderr)
-            print(f"Markdown report available at: {md_output_file}", file=sys.stderr)
+            print(f"Warning: HTML conversion not available", file=sys.stderr)
 
     return 0 if success else 1
 
