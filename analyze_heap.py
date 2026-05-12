@@ -520,7 +520,7 @@ def _assemble_report(worklog_dir: str, output_file: str,
     walker_path = os.path.join(worklog_dir, 'phase12_result.txt')
     summary_stats = {}
     if os.path.exists(walker_path):
-        with open(walker_path, 'r', encoding='utf-8') as f:
+        with open(walker_path, 'r', encoding='utf-8', errors='replace') as f:
             walker_text = f.read()
         # Parse SUMMARY_STATS
         for line in walker_text.split('\n'):
@@ -534,7 +534,7 @@ def _assemble_report(worklog_dir: str, output_file: str,
         for fname in os.listdir(worklog_dir):
             if fname.startswith('result_') and fname.endswith('.md'):
                 fpath = os.path.join(worklog_dir, fname)
-                with open(fpath, 'r', encoding='utf-8') as f:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
                 # Parse YAML frontmatter
                 meta = {}
@@ -668,12 +668,19 @@ def _find_session_jsonl(cwd: str, started_after: float) -> str | None:
 
 
 def _inspect_session(jsonl_path: str) -> dict:
-    """Extract diagnostics from a session transcript."""
+    """Extract diagnostics from a session transcript.
+
+    Supports both Claude Code and CodeBuddy JSONL formats:
+      - Claude: type="assistant", message.model, message.content[].type="tool_use"
+      - CodeBuddy: type="message" role="assistant", providerData.model,
+                   type="function_call", type="function_call_result"
+    """
     model = None
     tool_calls = 0
     last_tool = None
     last_assistant_text = ''
     stopped_with = None
+    last_error = ''
 
     try:
         with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -683,6 +690,8 @@ def _inspect_session(jsonl_path: str) -> dict:
                 except json.JSONDecodeError:
                     continue
                 t = j.get('type')
+
+                # Claude Code format
                 if t == 'assistant':
                     msg = j.get('message', {}) or {}
                     if not model:
@@ -698,6 +707,44 @@ def _inspect_session(jsonl_path: str) -> dict:
                             txt = c.get('text', '').strip()
                             if txt:
                                 last_assistant_text = txt
+
+                # CodeBuddy format: messages with role
+                elif t == 'message':
+                    role = j.get('role')
+                    pd = j.get('providerData', {}) or {}
+                    if not model:
+                        m = pd.get('model')
+                        if m:
+                            model = m
+                    if role == 'assistant':
+                        for c in j.get('content', []) or []:
+                            txt = c.get('text', '').strip()
+                            if txt:
+                                last_assistant_text = txt
+                        # Check for error in providerData
+                        err = pd.get('error', {})
+                        if err:
+                            last_error = err.get('message', str(err))
+
+                # CodeBuddy format: function calls
+                elif t == 'function_call':
+                    tool_calls += 1
+                    name = j.get('name', '')
+                    args = j.get('arguments', '')
+                    if isinstance(args, str) and len(args) > 200:
+                        args = args[:200] + '...'
+                    last_tool = (name, args)
+
+                # CodeBuddy format: function call results (may contain errors)
+                elif t == 'function_call_result':
+                    output = j.get('output', {})
+                    if isinstance(output, dict):
+                        text = output.get('text', '')
+                    else:
+                        text = str(output)
+                    if 'error' in text.lower() or '429' in text:
+                        last_error = text[:500]
+
                 elif t == 'attachment':
                     att = j.get('attachment', {}) or {}
                     if att.get('hookEvent') == 'Stop':
@@ -711,6 +758,7 @@ def _inspect_session(jsonl_path: str) -> dict:
         'last_tool': last_tool,
         'last_assistant_text': last_assistant_text,
         'stopped_with': stopped_with,
+        'last_error': last_error,
     }
 
 
@@ -720,6 +768,9 @@ def _format_diagnostics(diag: dict, jsonl_path: str | None) -> str:
     lines.append(f"Model:               {diag.get('model') or '(unknown)'}")
     lines.append(f"Total tool calls:    {diag.get('tool_calls')}")
     lines.append(f"Stopped via hook:    {diag.get('stopped_with') or '(no)'}")
+    err = diag.get('last_error') or ''
+    if err:
+        lines.append(f"Last error:          {err[:300]}")
     lt = diag.get('last_tool')
     if lt:
         name, args = lt
