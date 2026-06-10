@@ -6,6 +6,13 @@
 #include <QTextStream>
 #include <QDebug>
 #include <QPointF>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QVariant>
+#include <QDateTime>
+#include <QSet>
+#include <QHash>
 #include <functional>
 #include <algorithm>
 
@@ -552,6 +559,348 @@ bool ProfileComparator::ExportDumpToText(const QString& outputPath)
     }
 
     file.close();
+    return true;
+}
+
+bool ProfileComparator::ExportDumpToSqlite(const QString& outputPath)
+{
+    if (!compared_) {
+        errorMessage_ = "Must call DumpProfile() before exporting";
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Schema (snapshot mode):
+    //   metadata(key,value) -- magic/schema_version/app_version/mode/...
+    //   libraries(id,name)
+    //   symbols(library_id,address,name)        -- WITHOUT ROWID
+    //   nodes(id,parent_id,depth,function_name,library_id,func_addr,
+    //         size_bytes,count)
+    // node ids are assigned in stable DFS-pre-order (size DESC,
+    // function_name as tiebreaker) so two runs against the same .loli
+    // produce identical ids.
+    // ------------------------------------------------------------------
+
+    // Write to <output>.tmp first, atomic-rename at the end.  Prevents a
+    // half-written .db if the process is killed.
+    QString tmpPath = outputPath + QStringLiteral(".tmp");
+    if (QFile::exists(tmpPath)) {
+        QFile::remove(tmpPath);
+    }
+    if (QFile::exists(outputPath)) {
+        QFile::remove(outputPath);
+    }
+
+    static int s_connSeq = 0;
+    QString connName = QStringLiteral("loli_export_%1").arg(++s_connSeq);
+
+    bool ok = false;
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+        db.setDatabaseName(tmpPath);
+        if (db.open()) {
+            ok = WriteDumpToSqlite(db);
+            db.close();
+        } else {
+            errorMessage_ = QStringLiteral("Cannot open SQLite database: %1")
+                .arg(db.lastError().text());
+        }
+    }
+    QSqlDatabase::removeDatabase(connName);
+
+    if (!ok) {
+        QFile::remove(tmpPath);
+        return false;
+    }
+
+    // Atomic rename .tmp -> final path.
+    if (!QFile::rename(tmpPath, outputPath)) {
+        errorMessage_ = QStringLiteral("Failed to rename %1 -> %2")
+            .arg(tmpPath).arg(outputPath);
+        QFile::remove(tmpPath);
+        return false;
+    }
+
+    return true;
+}
+
+bool ProfileComparator::WriteDumpToSqlite(QSqlDatabase& db)
+{
+    auto execRaw = [&](const QString& sql) -> bool {
+        QSqlQuery q(db);
+        if (!q.exec(sql)) {
+            errorMessage_ = QStringLiteral("SQL failed: %1 :: %2")
+                .arg(q.lastError().text()).arg(sql);
+            return false;
+        }
+        return true;
+    };
+
+    // Bulk-write PRAGMAs.  The .db is a regenerable cache; durability
+    // is wasted overhead.
+    if (!execRaw(QStringLiteral("PRAGMA journal_mode=OFF"))) return false;
+    if (!execRaw(QStringLiteral("PRAGMA synchronous=OFF"))) return false;
+    if (!execRaw(QStringLiteral("PRAGMA temp_store=MEMORY"))) return false;
+    if (!execRaw(QStringLiteral("PRAGMA locking_mode=EXCLUSIVE"))) return false;
+    if (!execRaw(QStringLiteral("PRAGMA page_size=4096"))) return false;
+
+    // Schema DDL.
+    if (!execRaw(QStringLiteral(
+            "CREATE TABLE metadata("
+            "  key TEXT PRIMARY KEY,"
+            "  value TEXT)"))) return false;
+    if (!execRaw(QStringLiteral(
+            "CREATE TABLE libraries("
+            "  id INTEGER PRIMARY KEY,"
+            "  name TEXT UNIQUE NOT NULL)"))) return false;
+    if (!execRaw(QStringLiteral(
+            "CREATE TABLE symbols("
+            "  library_id INTEGER NOT NULL,"
+            "  address INTEGER NOT NULL,"
+            "  name TEXT NOT NULL,"
+            "  PRIMARY KEY(library_id, address)) WITHOUT ROWID"))) return false;
+    if (!execRaw(QStringLiteral(
+            "CREATE TABLE nodes("
+            "  id INTEGER PRIMARY KEY,"
+            "  parent_id INTEGER REFERENCES nodes(id),"
+            "  depth INTEGER NOT NULL,"
+            "  function_name TEXT NOT NULL,"
+            "  library_id INTEGER REFERENCES libraries(id),"
+            "  func_addr INTEGER NOT NULL,"
+            "  size_bytes INTEGER NOT NULL,"
+            "  count INTEGER NOT NULL)"))) return false;
+
+    // Single transaction for all bulk inserts.
+    if (!execRaw(QStringLiteral("BEGIN"))) return false;
+
+    // Library interning.  As we walk the tree we'll need a stable
+    // library_id per unique library name.
+    QHash<QString, qint64> libraryIds;
+    qint64 nextLibId = 1;
+
+    auto internLibrary = [&](const QString& name) -> QVariant {
+        if (name.isEmpty()) return QVariant(); // NULL
+        auto it = libraryIds.find(name);
+        if (it != libraryIds.end()) return QVariant(it.value());
+        qint64 id = nextLibId++;
+        libraryIds.insert(name, id);
+        return QVariant(id);
+    };
+
+    // Prepared statements for the hot path.
+    QSqlQuery insertNode(db);
+    if (!insertNode.prepare(QStringLiteral(
+            "INSERT INTO nodes(id, parent_id, depth, function_name, "
+            "library_id, func_addr, size_bytes, count) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)"))) {
+        errorMessage_ = QStringLiteral("prepare insertNode failed: %1")
+            .arg(insertNode.lastError().text());
+        return false;
+    }
+
+    // Stable child-ordering comparator: size DESC, function_name ASC,
+    // then libraryName, then functionAddress.  Mirrors
+    // WriteCallTreeToTextAbsolute's "size DESC" order with deterministic
+    // tiebreaks so node ids are reproducible across runs.
+    auto childOrder = [](CallTreeNode* a, CallTreeNode* b) {
+        if (a->size != b->size) return a->size > b->size;
+        int c = QString::compare(a->functionName, b->functionName);
+        if (c != 0) return c < 0;
+        if (a->libraryName != b->libraryName)
+            return a->libraryName < b->libraryName;
+        return a->functionAddress < b->functionAddress;
+    };
+
+    // Iterative DFS pre-order walk.  Recursion would risk stack overflow
+    // on deep call stacks (the sample has chains hundreds of frames long).
+    struct Frame {
+        CallTreeNode* node;
+        qint64 parentId; // -1 for roots
+        int depth;
+    };
+
+    QSet<QString> uniqueNames;
+    QVector<CallTreeNode*> sortedRoots = deltaRoots_;
+    std::sort(sortedRoots.begin(), sortedRoots.end(), childOrder);
+
+    QVector<Frame> stack;
+    stack.reserve(1024);
+    for (int i = sortedRoots.size() - 1; i >= 0; --i) {
+        Frame f;
+        f.node = sortedRoots[i];
+        f.parentId = -1;
+        f.depth = 0;
+        stack.append(f);
+    }
+
+    qint64 nextNodeId = 0;
+    qint64 nodesWritten = 0;
+
+    while (!stack.isEmpty()) {
+        Frame f = stack.takeLast();
+        CallTreeNode* node = f.node;
+        qint64 myId = nextNodeId++;
+
+        insertNode.bindValue(0, QVariant(myId));
+        if (f.parentId < 0) {
+            insertNode.bindValue(1, QVariant(QVariant::LongLong)); // NULL
+        } else {
+            insertNode.bindValue(1, QVariant(f.parentId));
+        }
+        insertNode.bindValue(2, QVariant(f.depth));
+        insertNode.bindValue(3, QVariant(node->functionName));
+        insertNode.bindValue(4, internLibrary(node->libraryName));
+        insertNode.bindValue(5, QVariant(static_cast<qulonglong>(node->functionAddress)));
+        insertNode.bindValue(6, QVariant(static_cast<qlonglong>(node->size)));
+        insertNode.bindValue(7, QVariant(static_cast<qlonglong>(node->count)));
+        if (!insertNode.exec()) {
+            errorMessage_ = QStringLiteral("insertNode failed at id=%1: %2")
+                .arg(myId).arg(insertNode.lastError().text());
+            return false;
+        }
+        ++nodesWritten;
+        uniqueNames.insert(node->functionName);
+
+        // Push children in reverse-sorted order so they pop in sorted order.
+        QVector<CallTreeNode*> kids = node->children;
+        std::sort(kids.begin(), kids.end(), childOrder);
+        for (int i = kids.size() - 1; i >= 0; --i) {
+            Frame cf;
+            cf.node = kids[i];
+            cf.parentId = myId;
+            cf.depth = f.depth + 1;
+            stack.append(cf);
+        }
+    }
+
+    // Flush libraries.
+    {
+        QSqlQuery insertLib(db);
+        if (!insertLib.prepare(QStringLiteral(
+                "INSERT INTO libraries(id, name) VALUES(?, ?)"))) {
+            errorMessage_ = QStringLiteral("prepare insertLib failed: %1")
+                .arg(insertLib.lastError().text());
+            return false;
+        }
+        for (auto it = libraryIds.constBegin(); it != libraryIds.constEnd(); ++it) {
+            insertLib.bindValue(0, QVariant(it.value()));
+            insertLib.bindValue(1, QVariant(it.key()));
+            if (!insertLib.exec()) {
+                errorMessage_ = QStringLiteral("insertLib failed: %1")
+                    .arg(insertLib.lastError().text());
+                return false;
+            }
+        }
+    }
+
+    // Symbol map (forensic only - Python CLI doesn't query it on the
+    // hot path).  Uses baselineData_.symbolMap since DumpProfile loaded
+    // the profile as baseline.
+    {
+        QSqlQuery insertSym(db);
+        if (!insertSym.prepare(QStringLiteral(
+                "INSERT INTO symbols(library_id, address, name) VALUES(?, ?, ?)"))) {
+            errorMessage_ = QStringLiteral("prepare insertSym failed: %1")
+                .arg(insertSym.lastError().text());
+            return false;
+        }
+        QSqlQuery insertLibLazy(db);
+        if (!insertLibLazy.prepare(QStringLiteral(
+                "INSERT INTO libraries(id, name) VALUES(?, ?)"))) {
+            errorMessage_ = QStringLiteral("prepare insertLibLazy failed: %1")
+                .arg(insertLibLazy.lastError().text());
+            return false;
+        }
+        for (auto libIt = baselineData_.symbolMap.constBegin();
+             libIt != baselineData_.symbolMap.constEnd(); ++libIt) {
+            const QString& libName = libIt.key();
+            qint64 libId;
+            auto known = libraryIds.find(libName);
+            if (known != libraryIds.end()) {
+                libId = known.value();
+            } else {
+                // Library name appeared in symbol map but no callstack
+                // node referenced it.  Intern lazily.
+                libId = nextLibId++;
+                libraryIds.insert(libName, libId);
+                insertLibLazy.bindValue(0, QVariant(libId));
+                insertLibLazy.bindValue(1, QVariant(libName));
+                if (!insertLibLazy.exec()) {
+                    errorMessage_ = QStringLiteral("insertLibLazy failed: %1")
+                        .arg(insertLibLazy.lastError().text());
+                    return false;
+                }
+            }
+            const auto& symbols = libIt.value();
+            for (auto symIt = symbols.constBegin(); symIt != symbols.constEnd(); ++symIt) {
+                insertSym.bindValue(0, QVariant(libId));
+                insertSym.bindValue(1, QVariant(static_cast<qulonglong>(symIt.key())));
+                insertSym.bindValue(2, QVariant(symIt.value()));
+                if (!insertSym.exec()) {
+                    // Address may already exist if multiple records resolved
+                    // the same (lib,addr).  Treat duplicates as non-fatal.
+                    QString err = insertSym.lastError().text();
+                    if (!err.contains(QStringLiteral("UNIQUE"), Qt::CaseInsensitive)) {
+                        errorMessage_ = QStringLiteral("insertSym failed: %1").arg(err);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Indexes - created AFTER bulk inserts so we don't pay per-row
+    // maintenance cost during the hot path.
+    if (!execRaw(QStringLiteral(
+            "CREATE INDEX idx_nodes_parent ON nodes(parent_id)"))) return false;
+    if (!execRaw(QStringLiteral(
+            "CREATE INDEX idx_nodes_size ON nodes(size_bytes DESC)"))) return false;
+
+    // Metadata stamps.
+    {
+        QSqlQuery insertMeta(db);
+        if (!insertMeta.prepare(QStringLiteral(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)"))) {
+            errorMessage_ = QStringLiteral("prepare insertMeta failed: %1")
+                .arg(insertMeta.lastError().text());
+            return false;
+        }
+        auto stamp = [&](const QString& key, const QString& value) -> bool {
+            insertMeta.bindValue(0, QVariant(key));
+            insertMeta.bindValue(1, QVariant(value));
+            if (!insertMeta.exec()) {
+                errorMessage_ = QStringLiteral("metadata stamp failed (%1): %2")
+                    .arg(key).arg(insertMeta.lastError().text());
+                return false;
+            }
+            return true;
+        };
+        if (!stamp(QStringLiteral("magic"), QStringLiteral("loli"))) return false;
+        if (!stamp(QStringLiteral("schema_version"), QStringLiteral("1"))) return false;
+        if (!stamp(QStringLiteral("app_version"), QString::number(APP_VERSION))) return false;
+        if (!stamp(QStringLiteral("mode"), QStringLiteral("snapshot"))) return false;
+        if (!stamp(QStringLiteral("total_allocations"),
+                   QString::number(stats_.baselineAllocCount))) return false;
+        if (!stamp(QStringLiteral("total_size_bytes"),
+                   QString::number(stats_.baselineTotalSize))) return false;
+        if (!stamp(QStringLiteral("total_size_display"),
+                   sizeToString(stats_.baselineTotalSize))) return false;
+        if (!stamp(QStringLiteral("skip_root_levels"),
+                   QString::number(skipRootLevels_))) return false;
+        if (!stamp(QStringLiteral("node_count"),
+                   QString::number(nodesWritten))) return false;
+        if (!stamp(QStringLiteral("root_count"),
+                   QString::number(sortedRoots.size()))) return false;
+        if (!stamp(QStringLiteral("unique_function_names"),
+                   QString::number(uniqueNames.size()))) return false;
+        if (!stamp(QStringLiteral("traversal"),
+                   QStringLiteral("size_desc_v1"))) return false;
+        if (!stamp(QStringLiteral("created_at"),
+                   QDateTime::currentDateTimeUtc().toString(Qt::ISODate))) return false;
+    }
+
+    if (!execRaw(QStringLiteral("COMMIT"))) return false;
+
     return true;
 }
 

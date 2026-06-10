@@ -16,13 +16,15 @@ echo Copying Python analysis scripts...
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/../markdown_to_html.py" "$DeployPath/"
 cp "$SCRIPT_DIR/../analyze_heap.py" "$DeployPath/"
-cp "$SCRIPT_DIR/../requirements.txt" "$DeployPath/"
+cp "$SCRIPT_DIR/../pyproject.toml" "$DeployPath/"
 
-echo Copying MCP server files...
-mkdir -p "$DeployPath/mcp_server"
-cp "$SCRIPT_DIR/../mcp_server/__init__.py" "$DeployPath/mcp_server/"
-cp "$SCRIPT_DIR/../mcp_server/tree_model.py" "$DeployPath/mcp_server/"
-cp "$SCRIPT_DIR/../mcp_server/heap_explorer_server.py" "$DeployPath/mcp_server/"
-cp "$SCRIPT_DIR/../.mcp.json" "$DeployPath/"
+echo Copying loli CLI files...
+mkdir -p "$DeployPath/loli_cli"
+cp "$SCRIPT_DIR/../loli_cli/__init__.py" "$DeployPath/loli_cli/"
+cp "$SCRIPT_DIR/../loli_cli/tree_model.py" "$DeployPath/loli_cli/"
+cp "$SCRIPT_DIR/../loli_cli/loli_convert.py" "$DeployPath/loli_cli/"
+cp "$SCRIPT_DIR/../loli_cli/core.py" "$DeployPath/loli_cli/"
+cp "$SCRIPT_DIR/../loli_cli/cli.py" "$DeployPath/loli_cli/"
+cp "$SCRIPT_DIR/../loli_cli/README.md" "$DeployPath/loli_cli/"
 
 echo finish Deployqt.....

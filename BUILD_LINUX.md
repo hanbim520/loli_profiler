@@ -99,14 +99,16 @@ LoliProfiler/
 ├── qt.conf                  # Qt configuration
 ├── lib/                     # Qt and other dependencies
 ├── plugins/                 # Qt plugins
-├── analyze_heap.py          # MCP-based AI analysis script
+├── analyze_heap.py          # CLI-based AI analysis script
 ├── markdown_to_html.py      # Markdown to HTML converter
-├── requirements.txt         # Python dependencies
-├── mcp_server/              # MCP heap explorer server
-│   ├── __init__.py
-│   ├── tree_model.py
-│   └── heap_explorer_server.py
-└── .mcp.json                # MCP server configuration
+├── pyproject.toml           # Python package metadata (loli CLI)
+└── loli_cli/                # `loli` heap explorer CLI
+    ├── __init__.py
+    ├── tree_model.py
+    ├── loli_convert.py
+    ├── core.py
+    ├── cli.py
+    └── README.md
 ```
 
 ## Platform Compatibility

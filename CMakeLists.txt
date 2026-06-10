@@ -32,9 +32,9 @@ project(${PROJECT_NAME})
 
 # Only find GUI components if BUILD_GUI is ON
 if(BUILD_GUI)
-    find_package(Qt5 COMPONENTS Core Widgets OpenGL Gui Network Charts Concurrent REQUIRED)
+    find_package(Qt5 COMPONENTS Core Widgets OpenGL Gui Network Charts Concurrent Sql REQUIRED)
 else()
-    find_package(Qt5 COMPONENTS Core Network Concurrent REQUIRED)
+    find_package(Qt5 COMPONENTS Core Network Concurrent Sql REQUIRED)
 endif()
 
 # Avoid generating ZERO_CHECK VS project, must in root CMakeLists.txt
@@ -178,7 +178,7 @@ target_include_directories(${PROJECT_NAME}
         thirdparty/qconsolewidget-master/src/
 )
 
-target_link_libraries(${PROJECT_NAME} 
+target_link_libraries(${PROJECT_NAME}
     Qt5::Core
     Qt5::Widgets
     Qt5::Gui
@@ -186,6 +186,7 @@ target_link_libraries(${PROJECT_NAME}
     Qt5::Charts
     Qt5::OpenGL
     Qt5::Concurrent
+    Qt5::Sql
 )
 
 if(APPLE AND NOT XCODE_VERSION)
@@ -272,11 +273,12 @@ target_include_directories(LoliProfilerCLI
         src/lz4/
 )
 
-# CLI only needs Core, Network, and Concurrent (no Widgets, Charts, OpenGL, Gui)
+# CLI only needs Core, Network, Concurrent, and Sql (no Widgets, Charts, OpenGL, Gui)
 target_link_libraries(LoliProfilerCLI
     Qt5::Core
     Qt5::Network
     Qt5::Concurrent
+    Qt5::Sql
 )
 
 if(APPLE AND NOT XCODE_VERSION)

@@ -12,6 +12,7 @@
 
 // Forward declarations
 class QTextStream;
+class QSqlDatabase;
 
 /**
  * ProfileComparator - Compares two .loli profiling files and generates diff reports
@@ -66,6 +67,16 @@ public:
      * @return true if export successful
      */
     bool ExportDumpToText(const QString& outputPath);
+
+    /**
+     * Export single profile dump to a SQLite database (.db).
+     * Schema is documented in profilecomparator.cpp's ExportDumpToSqlite.
+     * Stable DFS-pre-order numbering by size DESC (function_name as tiebreaker)
+     * is enforced so node ids are reproducible across runs of the same .loli.
+     * @param outputPath Path to output .db file
+     * @return true if export successful
+     */
+    bool ExportDumpToSqlite(const QString& outputPath);
 
     /**
      * Export comparison result to .loli format for GUI visualization
@@ -130,6 +141,12 @@ private:
 
     // Write call tree to text output (absolute format, no +/- prefix)
     void WriteCallTreeToTextAbsolute(QTextStream& stream, CallTreeNode* node, int depth);
+
+    // Inner body of ExportDumpToSqlite - runs all DDL/inserts inside a
+    // single connection.  Returns false on error (errorMessage_ already
+    // set).  The outer ExportDumpToSqlite handles connection lifetime
+    // and atomic .tmp -> final rename.
+    bool WriteDumpToSqlite(QSqlDatabase& db);
 
     // Convert delta tree to stack records and callstack map for .loli export
     void ConvertDeltaTreeToRecords(

@@ -74,15 +74,17 @@ bash scripts/Deployqt_linux.sh
 echo "Copying Python analysis scripts..."
 cp -v markdown_to_html.py $DeployPath/LoliProfiler/
 cp -v analyze_heap.py $DeployPath/LoliProfiler/
-cp -v requirements.txt $DeployPath/LoliProfiler/
+cp -v pyproject.toml $DeployPath/LoliProfiler/
 
-# Copy MCP server
-echo "Copying MCP server..."
-mkdir -p $DeployPath/LoliProfiler/mcp_server
-cp -v mcp_server/__init__.py $DeployPath/LoliProfiler/mcp_server/
-cp -v mcp_server/tree_model.py $DeployPath/LoliProfiler/mcp_server/
-cp -v mcp_server/heap_explorer_server.py $DeployPath/LoliProfiler/mcp_server/
-cp -v .mcp.json $DeployPath/LoliProfiler/
+# Copy loli CLI
+echo "Copying loli CLI..."
+mkdir -p $DeployPath/LoliProfiler/loli_cli
+cp -v loli_cli/__init__.py $DeployPath/LoliProfiler/loli_cli/
+cp -v loli_cli/tree_model.py $DeployPath/LoliProfiler/loli_cli/
+cp -v loli_cli/loli_convert.py $DeployPath/LoliProfiler/loli_cli/
+cp -v loli_cli/core.py $DeployPath/LoliProfiler/loli_cli/
+cp -v loli_cli/cli.py $DeployPath/LoliProfiler/loli_cli/
+cp -v loli_cli/README.md $DeployPath/LoliProfiler/loli_cli/
 
 # Copy config files if they exist
 if [ -d "res" ]; then

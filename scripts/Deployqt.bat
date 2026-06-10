@@ -3,6 +3,7 @@ echo Deployqt.....
 echo dir %cd%
 
 call %WindeployqtPath% %RelasePath%\LoliProfiler.exe
+call %WindeployqtPath% %RelasePath%\LoliProfilerCLI.exe
 
 if exist %DeployPath% (
     rmdir /s/q %DeployPath%
@@ -19,14 +20,16 @@ xcopy /S /Q %RelasePath%\* %DeployPath%\LoliProfiler\*
 echo Copying Python analysis scripts...
 copy /Y "%~dp0..\markdown_to_html.py" "%DeployPath%\LoliProfiler\"
 copy /Y "%~dp0..\analyze_heap.py" "%DeployPath%\LoliProfiler\"
-copy /Y "%~dp0..\requirements.txt" "%DeployPath%\LoliProfiler\"
+copy /Y "%~dp0..\pyproject.toml" "%DeployPath%\LoliProfiler\"
 
-echo Copying MCP server files...
-mkdir "%DeployPath%\LoliProfiler\mcp_server"
-copy /Y "%~dp0..\mcp_server\__init__.py" "%DeployPath%\LoliProfiler\mcp_server\"
-copy /Y "%~dp0..\mcp_server\tree_model.py" "%DeployPath%\LoliProfiler\mcp_server\"
-copy /Y "%~dp0..\mcp_server\heap_explorer_server.py" "%DeployPath%\LoliProfiler\mcp_server\"
-copy /Y "%~dp0..\.mcp.json" "%DeployPath%\LoliProfiler\"
+echo Copying loli CLI files...
+mkdir "%DeployPath%\LoliProfiler\loli_cli"
+copy /Y "%~dp0..\loli_cli\__init__.py" "%DeployPath%\LoliProfiler\loli_cli\"
+copy /Y "%~dp0..\loli_cli\tree_model.py" "%DeployPath%\LoliProfiler\loli_cli\"
+copy /Y "%~dp0..\loli_cli\loli_convert.py" "%DeployPath%\LoliProfiler\loli_cli\"
+copy /Y "%~dp0..\loli_cli\core.py" "%DeployPath%\LoliProfiler\loli_cli\"
+copy /Y "%~dp0..\loli_cli\cli.py" "%DeployPath%\LoliProfiler\loli_cli\"
+copy /Y "%~dp0..\loli_cli\README.md" "%DeployPath%\LoliProfiler\loli_cli\"
 
 powershell Compress-Archive -Path %DeployPath%\LoliProfiler -DestinationPath %DeployPath%\LoliProfiler.zip -Update
 

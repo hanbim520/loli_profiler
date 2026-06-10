@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Automated heap analysis using MCP server + LLM CLI (CodeBuddy / Claude Code).
+Automated heap analysis using the loli CLI + LLM CLI (CodeBuddy / Claude Code).
 
 Instead of dumping the entire data file (potentially hundreds of thousands of
-lines) into the LLM's prompt, this script launches an MCP server that loads the
-data and exposes query tools. The LLM interactively explores the heap data,
-searches source code, and writes a report — with only ~10-20KB of focused data
-entering the context window.
+lines) into the LLM's prompt, this script teaches the LLM to call the `loli`
+CLI (subcommands: summary, top, children, call-path, search, subtree) via the
+Bash tool. The LLM interactively explores the heap data, searches source code,
+and writes a report — with only ~10-20KB of focused data entering the context
+window.
 
 Supports these file formats:
-  - .loli files (raw LoliProfiler capture, auto-converted by MCP server)
+  - .loli files (raw LoliProfiler capture, auto-converted by the CLI on first use)
   - .txt snapshot files from `LoliProfilerCLI --dump`
   - .txt diff files from `LoliProfilerCLI --compare`
 
@@ -19,9 +20,6 @@ Usage:
 
     # Analyze a pre-converted .txt snapshot
     python analyze_heap.py snapshot.txt --repo /path/to/source -o report.md
-
-    # Specify model via CodeBuddy
-    python analyze_heap.py snapshot.txt --no-source --model gpt-5.5
 
     # HTML output with custom threshold
     python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0 -o report.html
@@ -34,7 +32,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -109,9 +106,13 @@ def build_prompt(output_file: str,
     """Build the analysis prompt for the LLM.
 
     The prompt drives a 3-phase pipeline where the LLM does ALL the work:
-      Phase 1+2: Walker sub-agent explores the heap tree via MCP tools
+      Phase 1+2: Walker sub-agent explores the heap tree via the loli CLI
       Phase 3:   Per-hotspot sub-agents do deep analysis, each writes result_<id>.md
       (Report assembly is done by the Python harness after the LLM exits)
+
+    The LLM accesses heap data by shelling out to `python -m loli_cli.cli ...`
+    via the Bash tool. Each invocation is stateless — the file path is passed
+    as the first positional argument every time.
 
     This lets the LLM reason about the data like a human engineer: adapting
     its walk depth, noticing patterns, and making judgment calls.
@@ -167,7 +168,7 @@ The profiles are from different versions. You can diff files between repos."""
     if no_source:
         source_grep_instruction = (
             "No source repo available — DO NOT use Grep or Read to search source code. "
-            "Skip step 2 and go directly to step 3 (composition via get_children). "
+            "Skip step 2 and go directly to step 3 (composition via the `children` CLI). "
             "Reason about the hotspot using general knowledge of Unreal Engine 4, "
             "the Unreal rendering pipeline, common third-party libraries, and "
             "standard C/C++ runtime."
@@ -185,7 +186,7 @@ The profiles are from different versions. You can diff files between repos."""
     else:
         source_grep_instruction = (
             "No source repo configured — skip source code analysis. Go directly "
-            "to step 3 (composition via get_children)."
+            "to step 3 (composition via the `children` CLI)."
         )
 
     # ── Build conditional prompt fragments for worklogs ────────────────
@@ -220,8 +221,65 @@ The profiles are from different versions. You can diff files between repos."""
         walker_worklog_instruction = ""
         phase3_worklog_instruction = ""
 
+    # ── Tool-invocation instructions (loli CLI via Bash) ─────────────────
+    abs_data_file = os.path.abspath(data_file)
+    # The CLI is invoked via Bash. Each call is stateless: every command
+    # takes the data file path as the first positional argument, which we
+    # pre-fill below.
+    #
+    # Only the three subcommands the walker / Phase-3 sub-agents actually
+    # need are advertised here: `summary`, `children`, `call-path`. The CLI
+    # supports more (top, search, subtree, load-file) but they're not used
+    # by this workflow — listing them only wastes prompt tokens and tempts
+    # the LLM into unnecessary calls.
+    tool_reference = f"""HEAP DATA TOOLS:
+The heap data is queried via the `loli` CLI, run through the Bash tool. Each
+invocation is stateless — pass the file path as the first positional argument.
+
+The data file is:
+    {abs_data_file}
+
+Available subcommands (the only three you need):
+
+  python -m loli_cli.cli summary <FILE>
+      Header stats + tree metadata + top 5 roots. Run this once at the start
+      to get total size, total allocations, and root count.
+
+  python -m loli_cli.cli children <FILE> <NODE_ID>
+      Direct children of a node, sorted by size descending. Each line:
+          [<child_node_id>] <size>, count=<N> | <function_name>
+      This is your primary tool for descending the call tree.
+
+  python -m loli_cli.cli call-path <FILE> <NODE_ID>
+      Trace the full call path from root down to <NODE_ID>. Use this once
+      per hotspot to capture the complete calling context.
+
+Usage examples (run via Bash):
+    python -m loli_cli.cli summary "{abs_data_file}"
+    python -m loli_cli.cli children "{abs_data_file}" 12345
+    python -m loli_cli.cli call-path "{abs_data_file}" 12345
+
+NOTE: the very first call against a `.loli` file may take 10-30s while it
+auto-converts to `.txt` (cached on disk for subsequent calls). All later
+calls are fast.
+"""
+    # Pre-baked tool-call snippets used inside the walker / phase-3 briefs.
+    walker_summary_step = f'python -m loli_cli.cli summary "{abs_data_file}"     (via Bash)'
+    walker_get_children_call = f'python -m loli_cli.cli children "{abs_data_file}" <node_id>'
+    phase3_call_path_step = (
+        f'Run via Bash:\n       python -m loli_cli.cli call-path '
+        f'"{abs_data_file}" [node_id]'
+    )
+    phase3_children_step = (
+        f'Run via Bash:\n       python -m loli_cli.cli children '
+        f'"{abs_data_file}" [node_id]\n'
+        f'    to see the COMPOSITION — what specifically accounts for the [X.X] MB?\n'
+        f'    If any child is >= 30% of the hotspot size, run children on that child too\n'
+        f'    (one level deeper).'
+    )
+
     return f"""You are a memory analysis agent. Analyze a LoliProfiler {report_title} using
-the loli-heap MCP tools. Follow the phases below EXACTLY in order.
+the loli CLI heap-data tools. Follow the phases below EXACTLY in order.
 
 {source_section}
 
@@ -231,13 +289,15 @@ RESULT DIRECTORY (already created): {worklog_dir}
 Phase 3 sub-agents MUST write their analysis to result_<node_id>.md files here.
 The Python harness will assemble these into the final report after you finish.
 
+{tool_reference}
+
 ═══════════════════════════════════════════════════════════════
 PHASE 1+2: DATA LOADING AND THREAD-GROUPED HOTSPOT DISCOVERY (walker sub-agent)
 ═══════════════════════════════════════════════════════════════
 
 Dispatch ONE sub-agent (the "walker") via a single Agent tool-use block. The walker
 loads the heap data, walks the call tree, discovers thread-grouped hotspots, and
-returns structured data. You do NOT call any loli-heap MCP tools during this phase.
+returns structured data. You do NOT call any heap-data tools yourself during this phase.
 
 Copy everything between the ── WALKER BRIEF ── markers below as the Agent prompt.
 All values are pre-filled — paste verbatim, do not modify any part:
@@ -250,8 +310,9 @@ tree from roots down, and return thread-grouped memory hotspots.
 
 Steps:
 
-1. load_file("{os.path.abspath(data_file)}")
-2. get_summary() — record total size, total allocations, root count.
+1. {walker_summary_step}
+   — record total size, total allocations, root count.
+   (This first call also implicitly loads/parses the heap data file.)
 
 The walk algorithm is STRUCTURAL — no hard-coded function names. Two primitives:
 
@@ -302,7 +363,7 @@ KNOWN THREAD PATTERNS (hints — these are NOT hard-coded filters):
   one level deeper. The structural walk (pass-through/fan-out) is still the PRIMARY
   logic — these hints supplement it.
 
-3. UNIFIED WALK — discovers threads AND hotspots in one pass.
+2. UNIFIED WALK — discovers threads AND hotspots in one pass.
 
    The walk descends from each root through pass-through chains. The FIRST fan-out
    from a root defines the thread labels. Subsequent fan-outs inside a thread
@@ -317,11 +378,11 @@ KNOWN THREAD PATTERNS (hints — these are NOT hard-coded filters):
      #   malloc, _malloc*, realloc, _realloc*, operator new, operator delete,
      #   *::Malloc, *::Realloc, *::Free, *::ResizeTo, *::ResizeGrow, FMemory::*,
      #   FMalloc*::*, mmap, *_zone_malloc*, *_zone_realloc*
-     # then do NOT call get_children — return immediately.
+     # then do NOT call children — return immediately.
      if node.function_name matches a terminal-allocator pattern:
        return
 
-     children = get_children(node)
+     children = run({walker_get_children_call})
      BIG = children with size >= {min_size_mb} MB
 
      if len(BIG) == 0:
@@ -358,18 +419,15 @@ KNOWN THREAD PATTERNS (hints — these are NOT hard-coded filters):
    CRITICAL: the walk MUST continue past thread boundaries into the actual hotspots.
 
    Notes:
-     - If get_children errors with "output too large", fall back to
-       get_top_allocations(50, {min_size_mb}) filtered by get_call_path.
-     - Never call get_subtree with max_depth >= 5 on unknown-shape subtrees.
      - DEDUP: if an existing hotspot is an ancestor/descendant of a new one,
        keep only the deeper (more specific) node.
      - Cap total recorded hotspots at 25.
 
-4. Return EXACTLY this format (no other text before or after):
+3. Return EXACTLY this format (no other text before or after):
 
 SUMMARY_STATS:
-total_size: [from get_summary, e.g. "1.76 GB"]
-total_allocs: [from get_summary, e.g. "489,493"]
+total_size: [from summary, e.g. "1.76 GB"]
+total_allocs: [from summary, e.g. "489,493"]
 root_count: [root count]
 thread_count: [number of unique thread labels]
 
@@ -383,7 +441,7 @@ THREADS_AND_HOTSPOTS:
 Sort threads by summed hotspot size descending; hotspots within thread by size descending.
 
 SELF-CHECK: if ANY thread has only ONE hotspot whose size equals the entire thread,
-the walk stopped too early. Call get_children on that node and continue descending.
+the walk stopped too early. Run `children` on that node and continue descending.
 ── WALKER BRIEF END ────────────────────────────────────────────
 
 After the walker returns, extract SUMMARY_STATS and THREADS_AND_HOTSPOTS from its
@@ -415,12 +473,10 @@ Each **hotspot sub-agent** receives this brief (fill in the bracketed values):
 
 {phase3_worklog_instruction}
     Exploration steps:
-    1. Call get_call_path([node_id]) to confirm the full calling context.
+    1. {phase3_call_path_step}
+       to confirm the full calling context.
     2. {source_grep_instruction}
-    3. Call get_children([node_id]) to see the COMPOSITION — what specifically accounts
-       for the [X.X] MB? If any child is >= 30% of the hotspot size, call get_children
-       on that child too (one level deeper).
-    4. If get_children errors with "output too large", use get_top_allocations as fallback.
+    3. {phase3_children_step}
 
     RESULT FILE — MANDATORY:
     Use the Write tool to save your analysis to:
@@ -449,7 +505,7 @@ Each **hotspot sub-agent** receives this brief (fill in the bracketed values):
     **源码分析:** [2-3 sentences in Chinese: what this code does, what it allocates]
 
     **内存占用原因:** [2-3 sentences in Chinese: why this allocation is large,
-    reference specific children from get_children]
+    reference specific children from the children query]
 
     **优化建议:** [2-3 sentences in Chinese: specific, actionable optimization suggestions]
 
@@ -472,23 +528,6 @@ IMPORTANT RULES:
 - PHASE 3: dispatch one Agent per hotspot. Each writes result_<id>.md.
 - Do NOT write the final report — the harness does that from result files.
 """
-
-
-def build_mcp_config() -> dict:
-    """Build the MCP server configuration."""
-    server_script = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        'mcp_server', 'heap_explorer_server.py'
-    )
-    return {
-        "mcpServers": {
-            "loli-heap": {
-                "command": sys.executable,
-                "args": [server_script],
-                "env": {}
-            }
-        }
-    }
 
 
 def _worklog_dir_for(output_file: str) -> str:
@@ -796,10 +835,12 @@ def run_analysis(data_file: str,
                  no_source: bool = False,
                  worklogs_enabled: bool = False,
                  model: str = "") -> bool:
-    """Run an LLM CLI with MCP server to analyze heap data.
+    """Run an LLM CLI to analyze heap data.
 
-    The LLM does Phase 1+2 (walk) and Phase 3 (deep analysis).
-    The Python harness then assembles result files into the final report.
+    The LLM does Phase 1+2 (walk) and Phase 3 (deep analysis), driving the
+    `loli` CLI through the Bash tool (`python -m loli_cli.cli ...`) for all
+    heap-data queries. The Python harness then assembles the per-hotspot
+    result files into the final report.
     """
     cli_cmd = find_cli_command()
     if not cli_cmd:
@@ -818,162 +859,170 @@ def run_analysis(data_file: str,
     os.makedirs(worklog_dir, exist_ok=True)
     print(f"Worklog dir: {worklog_dir}")
 
-    mcp_config = build_mcp_config()
-    with tempfile.TemporaryDirectory(prefix='loli_mcp_') as tmp_dir:
-        mcp_config_path = os.path.join(tmp_dir, '.mcp.json')
-        with open(mcp_config_path, 'w') as f:
-            json.dump(mcp_config, f, indent=2)
+    # The directory containing this script — parent of the loli_cli/ package.
+    # We add it to PYTHONPATH for the LLM subprocess so child Bash invocations
+    # of `python -m loli_cli.cli ...` resolve regardless of cwd.
+    repo_root = os.path.dirname(os.path.abspath(__file__))
 
-        print(f"MCP config: {mcp_config_path}")
+    prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb,
+                          mode=mode, data_file=data_file, no_source=no_source,
+                          worklog_dir=worklog_dir,
+                          worklogs_enabled=worklogs_enabled)
 
-        prompt = build_prompt(abs_output, base_repo, target_repo, min_size_mb,
-                              mode=mode, data_file=data_file, no_source=no_source,
-                              worklog_dir=worklog_dir,
-                              worklogs_enabled=worklogs_enabled)
+    prompt_size_kb = len(prompt.encode('utf-8')) / 1024
+    print(f"Prompt size: {prompt_size_kb:.1f} KB")
+    print()
 
-        prompt_size_kb = len(prompt.encode('utf-8')) / 1024
-        print(f"Prompt size: {prompt_size_kb:.1f} KB")
+    try:
+        cwd = os.getcwd()
+        if mode == "snapshot":
+            if base_repo and os.path.isdir(base_repo):
+                cwd = base_repo
+        else:
+            if target_repo and os.path.isdir(target_repo):
+                cwd = target_repo
+            elif base_repo and os.path.isdir(base_repo):
+                cwd = base_repo
+        is_windows = sys.platform.startswith('win')
+
+        cmd_args = [
+            cli_cmd, '-p',
+            '--verbose',
+            '--dangerously-skip-permissions',
+        ]
+        if model:
+            cmd_args.extend(['--model', model])
+
+        # Inject PYTHONPATH so child `python -m loli_cli.cli ...` calls
+        # can find the loli_cli package no matter what cwd the LLM ran
+        # under. Inherit the rest of the environment.
+        child_env = os.environ.copy()
+        existing_pp = child_env.get("PYTHONPATH", "")
+        sep = os.pathsep
+        if repo_root and repo_root not in existing_pp.split(sep):
+            child_env["PYTHONPATH"] = (
+                f"{repo_root}{sep}{existing_pp}" if existing_pp else repo_root
+            )
+
+        t_start = time.monotonic()
+        started_wall = time.time()
+        result = subprocess.run(
+            cmd_args,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout,
+            cwd=cwd,
+            shell=is_windows,
+            env=child_env,
+        )
+        duration_sec = time.monotonic() - t_start
+
+        session_jsonl = _find_session_jsonl(cwd, started_wall - 5)
+        diag = _inspect_session(session_jsonl) if session_jsonl else {
+            'model': None, 'tool_calls': 0, 'last_tool': None,
+            'last_assistant_text': '', 'stopped_with': None,
+        }
+
+        if result.returncode != 0:
+            print(f"Analysis failed (exit {result.returncode}):", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr[:2000], file=sys.stderr)
+            print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
+            # Still try to assemble whatever result files were produced
+            print("Attempting partial report assembly from result files...",
+                  file=sys.stderr)
+
+        print(f"\nLLM phase duration: {_format_duration(duration_sec)}")
+
+        # List result files
+        try:
+            result_files = [f for f in os.listdir(worklog_dir)
+                            if f.startswith('result_') and f.endswith('.md')]
+            worklog_files = [f for f in os.listdir(worklog_dir)
+                             if f.endswith('.md') and not f.startswith('result_')]
+        except OSError:
+            result_files = []
+            worklog_files = []
+        print(f"Result files: {len(result_files)}")
+        if worklog_files:
+            print(f"Debug worklogs: {len(worklog_files)} files")
+
+        # Assemble report from result files
+        if mode == "snapshot":
+            report_title = "内存快照分析报告"
+            base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+            header_rows = f"| 代码版本 | {base_label} |"
+        else:
+            report_title = "内存对比分析报告"
+            base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
+            target_label = os.path.basename(target_repo) if target_repo else "N/A (no source)"
+            header_rows = (
+                f"| 基线版本 | {base_label} |\n"
+                f"| 对比版本 | {target_label} |"
+            )
+
+        gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time_str = datetime.fromtimestamp(started_wall).strftime('%Y-%m-%d %H:%M:%S')
+        cli_basename = os.path.splitext(os.path.basename(cli_cmd))[0]
+        if _assemble_report(worklog_dir, abs_output, report_title,
+                            header_rows, gen_time,
+                            start_time=start_time_str,
+                            duration_str=_format_duration(duration_sec),
+                            cli_name=cli_basename,
+                            model_name=model):
+            with open(abs_output, 'r', encoding='utf-8') as f:
+                report = f.read()
+            print(f"\nANALYSIS COMPLETE")
+            print(f"Report assembled from {len(result_files)} result files: {abs_output}")
+        elif os.path.exists(abs_output):
+            # LLM may have written the report directly (legacy behavior)
+            with open(abs_output, 'r', encoding='utf-8') as f:
+                report = f.read()
+            print(f"\nANALYSIS COMPLETE")
+            print(f"Report written by LLM: {abs_output}")
+        else:
+            print("No result files and no report produced.", file=sys.stderr)
+            print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
+            return False
+
+        # Preview
+        print()
+        print("Report preview:")
+        print("-" * 80)
+        for line in report.split('\n')[:60]:
+            print(line)
+        if len(report.split('\n')) > 60:
+            print(f"\n... ({len(report.split(chr(10))) - 60} more lines)")
         print()
 
-        try:
-            cwd = os.getcwd()
-            if mode == "snapshot":
-                if base_repo and os.path.isdir(base_repo):
-                    cwd = base_repo
-            else:
-                if target_repo and os.path.isdir(target_repo):
-                    cwd = target_repo
-                elif base_repo and os.path.isdir(base_repo):
-                    cwd = base_repo
-            is_windows = sys.platform.startswith('win')
+        return True
 
-            cmd_args = [
-                cli_cmd, '-p',
-                '--verbose',
-                '--dangerously-skip-permissions',
-                '--mcp-config', mcp_config_path,
-            ]
-            if model:
-                cmd_args.extend(['--model', model])
-
-            t_start = time.monotonic()
-            started_wall = time.time()
-            result = subprocess.run(
-                cmd_args,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout,
-                cwd=cwd,
-                shell=is_windows,
-            )
-            duration_sec = time.monotonic() - t_start
-
-            session_jsonl = _find_session_jsonl(cwd, started_wall - 5)
-            diag = _inspect_session(session_jsonl) if session_jsonl else {
-                'model': None, 'tool_calls': 0, 'last_tool': None,
-                'last_assistant_text': '', 'stopped_with': None,
-            }
-
-            if result.returncode != 0:
-                print(f"Analysis failed (exit {result.returncode}):", file=sys.stderr)
-                if result.stderr:
-                    print(result.stderr[:2000], file=sys.stderr)
-                print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
-                # Still try to assemble whatever result files were produced
-                print("Attempting partial report assembly from result files...",
-                      file=sys.stderr)
-
-            print(f"\nLLM phase duration: {_format_duration(duration_sec)}")
-
-            # List result files
-            try:
-                result_files = [f for f in os.listdir(worklog_dir)
-                                if f.startswith('result_') and f.endswith('.md')]
-                worklog_files = [f for f in os.listdir(worklog_dir)
-                                 if f.endswith('.md') and not f.startswith('result_')]
-            except OSError:
-                result_files = []
-                worklog_files = []
-            print(f"Result files: {len(result_files)}")
-            if worklog_files:
-                print(f"Debug worklogs: {len(worklog_files)} files")
-
-            # Assemble report from result files
-            if mode == "snapshot":
-                report_title = "内存快照分析报告"
-                base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
-                header_rows = f"| 代码版本 | {base_label} |"
-            else:
-                report_title = "内存对比分析报告"
-                base_label = os.path.basename(base_repo) if base_repo else "N/A (no source)"
-                target_label = os.path.basename(target_repo) if target_repo else "N/A (no source)"
-                header_rows = (
-                    f"| 基线版本 | {base_label} |\n"
-                    f"| 对比版本 | {target_label} |"
-                )
-
-            gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            start_time_str = datetime.fromtimestamp(started_wall).strftime('%Y-%m-%d %H:%M:%S')
-            cli_basename = os.path.splitext(os.path.basename(cli_cmd))[0]
-            if _assemble_report(worklog_dir, abs_output, report_title,
-                                header_rows, gen_time,
-                                start_time=start_time_str,
-                                duration_str=_format_duration(duration_sec),
-                                cli_name=cli_basename,
-                                model_name=model):
-                with open(abs_output, 'r', encoding='utf-8') as f:
-                    report = f.read()
-                print(f"\nANALYSIS COMPLETE")
-                print(f"Report assembled from {len(result_files)} result files: {abs_output}")
-            elif os.path.exists(abs_output):
-                # LLM may have written the report directly (legacy behavior)
-                with open(abs_output, 'r', encoding='utf-8') as f:
-                    report = f.read()
-                print(f"\nANALYSIS COMPLETE")
-                print(f"Report written by LLM: {abs_output}")
-            else:
-                print("No result files and no report produced.", file=sys.stderr)
-                print(_format_diagnostics(diag, session_jsonl), file=sys.stderr)
-                return False
-
-            # Preview
-            print()
-            print("Report preview:")
-            print("-" * 80)
-            for line in report.split('\n')[:60]:
-                print(line)
-            if len(report.split('\n')) > 60:
-                print(f"\n... ({len(report.split(chr(10))) - 60} more lines)")
-            print()
-
-            return True
-
-        except subprocess.TimeoutExpired:
-            print(f"Analysis timed out after {timeout // 60} minutes", file=sys.stderr)
-            # Try partial assembly
-            gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if mode == "snapshot":
-                rt, hr = "内存快照分析报告", f"| 代码版本 | N/A |"
-            else:
-                rt, hr = "内存对比分析报告", "| 基线版本 | N/A |\n| 对比版本 | N/A |"
-            if _assemble_report(worklog_dir, abs_output, rt, hr, gen_time,
-                                cli_name=os.path.splitext(os.path.basename(cli_cmd))[0],
-                                model_name=model):
-                print(f"Partial report assembled from available result files: {abs_output}")
-            return False
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            return False
+    except subprocess.TimeoutExpired:
+        print(f"Analysis timed out after {timeout // 60} minutes", file=sys.stderr)
+        # Try partial assembly
+        gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if mode == "snapshot":
+            rt, hr = "内存快照分析报告", f"| 代码版本 | N/A |"
+        else:
+            rt, hr = "内存对比分析报告", "| 基线版本 | N/A |\n| 对比版本 | N/A |"
+        if _assemble_report(worklog_dir, abs_output, rt, hr, gen_time,
+                            cli_name=os.path.splitext(os.path.basename(cli_cmd))[0],
+                            model_name=model):
+            print(f"Partial report assembled from available result files: {abs_output}")
+        return False
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze LoliProfiler heap data via MCP server + LLM CLI',
+        description='Analyze LoliProfiler heap data via the loli CLI + LLM CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

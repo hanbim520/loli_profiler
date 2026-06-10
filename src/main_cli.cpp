@@ -59,9 +59,9 @@ void printUsage() {
     std::cout << "Compare Mode - Optional Options:\n";
     std::cout << "  --skip-root-levels <N> Skip N root call stack frames (useful for system libs without symbols)\n\n";
     std::cout << "Dump Mode - Usage:\n";
-    std::cout << "  --dump                 Export a single .loli file to text format\n";
+    std::cout << "  --dump                 Export a single .loli file to text or SQLite format\n";
     std::cout << "  <profile.loli>         Input .loli file (positional argument)\n";
-    std::cout << "  --out <path>           Output text file path\n\n";
+    std::cout << "  --out <path>           Output path (.txt for text report, .db for SQLite database)\n\n";
     std::cout << "Dump Mode - Optional Options:\n";
     std::cout << "  --skip-root-levels <N> Skip N root call stack frames (useful for system libs without symbols)\n\n";
     std::cout << "General Options:\n";
@@ -81,6 +81,8 @@ void printUsage() {
     std::cout << "  LoliProfilerCLI --compare baseline.loli comparison.loli --out diff.txt --skip-root-levels 2\n\n";
     std::cout << "  # Dump a single .loli file to text\n";
     std::cout << "  LoliProfilerCLI --dump profile.loli --out dump.txt\n\n";
+    std::cout << "  # Dump a single .loli file to a SQLite database (fast random-access)\n";
+    std::cout << "  LoliProfilerCLI --dump profile.loli --out dump.db\n\n";
     std::cout << "  # Dump with skipping root levels\n";
     std::cout << "  LoliProfilerCLI --dump profile.loli --out dump.txt --skip-root-levels 2\n";
 }
@@ -367,14 +369,28 @@ int main(int argc, char *argv[]) {
         std::cout << "Total allocations: " << stats.baselineAllocCount << "\n";
         std::cout << "Total size: " << sizeToString(stats.baselineTotalSize).toStdString() << "\n\n";
 
-        // Export to text
-        std::cout << "Exporting to text file: " << outputFile.toStdString() << "...\n";
+        // Detect output format based on file extension:
+        //   .db   -> SQLite database (indexed, fast random-access for the
+        //            Python CLI / agents)
+        //   else  -> text format (legacy)
+        bool exportAsSqlite = outputFile.toLower().endsWith(".db");
 
-        if (!comparator.ExportDumpToText(outputFile)) {
-            CLI_ERROR(QString("Failed to export: %1").arg(comparator.GetErrorMessage()));
-            std::cerr << "Error: " << comparator.GetErrorMessage().toStdString() << "\n";
-            CliLogger::Instance().Close();
-            return 1;
+        if (exportAsSqlite) {
+            std::cout << "Exporting to SQLite database: " << outputFile.toStdString() << "...\n";
+            if (!comparator.ExportDumpToSqlite(outputFile)) {
+                CLI_ERROR(QString("Failed to export SQLite: %1").arg(comparator.GetErrorMessage()));
+                std::cerr << "Error: " << comparator.GetErrorMessage().toStdString() << "\n";
+                CliLogger::Instance().Close();
+                return 1;
+            }
+        } else {
+            std::cout << "Exporting to text file: " << outputFile.toStdString() << "...\n";
+            if (!comparator.ExportDumpToText(outputFile)) {
+                CLI_ERROR(QString("Failed to export: %1").arg(comparator.GetErrorMessage()));
+                std::cerr << "Error: " << comparator.GetErrorMessage().toStdString() << "\n";
+                CliLogger::Instance().Close();
+                return 1;
+            }
         }
 
         std::cout << "Dump complete! Output saved to: " << outputFile.toStdString() << "\n";

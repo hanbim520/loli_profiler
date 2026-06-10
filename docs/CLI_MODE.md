@@ -247,34 +247,49 @@ FRunnableThreadPThread::Run(), +18.44 MB, +79446
 
 **Loli format:** Can be opened in LoliProfiler GUI for interactive exploration.
 
-## AI-Powered Memory Analysis
+## Heap Exploration with the `loli` CLI
 
-For automated analysis of diff or snapshot files, use `analyze_heap.py` which launches an MCP server and Claude Code to interactively explore heap data and generate detailed reports.
+For interactive analysis of `.loli` captures (or `.txt` files produced by
+`--dump` / `--compare`), the project ships a separate `loli` CLI that
+loads heap data into an indexed in-memory tree and exposes query
+subcommands.
 
 ### Quick Start
 
 ```bash
-# Analyze a diff
-python analyze_heap.py diff.txt --repo /path/to/source -o report.md
+# Install the loli CLI (one-time)
+pip install -e .
 
-# Analyze a heap snapshot
-python analyze_heap.py snapshot.txt --repo /path/to/source -o report.md
+# Discoverability — JSON-shaped help for agents
+loli describe
 
-# HTML output
-python analyze_heap.py diff.txt --repo /path/to/source -o report.html
+# Summary on a raw .loli capture (auto-converts to .txt + caches on disk)
+loli summary /path/to/profile.loli
 
-# Different repos for baseline vs comparison
-python analyze_heap.py diff.txt --base-repo /path/to/v1 --target-repo /path/to/v2
+# Top 10 hotspots over 5 MB
+loli top /path/to/profile.loli -n 10 --min-size-mb 5
 
-# Custom minimum size threshold
-python analyze_heap.py diff.txt --repo /path/to/source --min-size 1.0
+# Drill into a node
+loli children /path/to/profile.loli 0
+loli call-path /path/to/profile.loli 31162
+loli subtree /path/to/profile.loli 0 --max-depth 3
+
+# Regex search across function names
+loli search /path/to/profile.loli "FMemory|Realloc" --max 10
+
+# JSON mode (for piping to jq or scripting)
+loli top /path/to/profile.loli -n 5 --json | jq '.results'
 ```
 
 ### How It Works
 
-Instead of embedding the entire data file into a prompt, `analyze_heap.py` starts an MCP server that loads the data into an indexed in-memory tree. Claude Code explores the data interactively via tool calls (~10-20KB of context), searches source code, and writes a structured Chinese-language report.
+`loli` shells out to `LoliProfilerCLI --dump` to convert raw `.loli`
+files to sqlite database on first use (cached alongside the input by mtime), then
+you can query the database for a tree of `(function_name, size, count)` nodes.
 
-For full details on the MCP tools, interactive mode, and architecture, see [MCP Heap Explorer](MCP_HEAP_EXPLORER.md).
+For full details on every subcommand, the migration table from the
+historical MCP server, and programmatic Python use, see
+[`loli_cli/README.md`](../loli_cli/README.md).
 
 ## See Also
 
