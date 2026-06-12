@@ -38,6 +38,7 @@ LoliProfiler supports profiling debuggable applications out of box. And offers e
 * [Trouble Shooting](docs/TROUBLE_SHOOTING.md)
 * [Build Project](docs/BUILD.md)
 * [How Does It Work](docs/PRINCIPLE.md) [(Chinese)](docs/PRINCIPLE_CN.md)
+* [Architecture & Developer Reference](docs/ARCH.md) - Components, data structures, threading, pitfalls
 
 # Special Thanks
 
