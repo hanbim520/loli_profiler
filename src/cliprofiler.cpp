@@ -356,37 +356,42 @@ void CliProfiler::OnScreenshotProcessErrorOccurred() {
 void CliProfiler::OnStacktraceDataReceived() {
     if (!isConnected_ || !isCapturing_)
         return;
-    
+
     const auto& stacks = stacktraceProcess_->GetStackInfo();
     const auto& frees = stacktraceProcess_->GetFreeInfo();
-    
-    // Cache data
-    auto cacheDirPath = QCoreApplication::applicationDirPath() + "/cache";
-    if (!QDir(cacheDirPath).exists()) {
-        QDir().mkdir(cacheDirPath);
+
+    if (options_.enableMemoryOptimization) {
+        // Stream to disk cache to reduce RAM usage (mirrors GUI useCache_ behaviour)
+        auto cacheDirPath = QCoreApplication::applicationDirPath() + "/cache";
+        if (!QDir(cacheDirPath).exists()) {
+            QDir().mkdir(cacheDirPath);
+        }
+
+        static quint32 cacheIndex = 0;
+        auto cachePath = QString("%1/cache_%2.bin").arg(cacheDirPath).arg(cacheIndex);
+        QFile cacheFile(cachePath);
+        if (!cacheFile.open(QFile::OpenModeFlag::WriteOnly | QFile::OpenModeFlag::Append)) {
+            Print("Failed to open cache file: " + cachePath);
+            return;
+        }
+
+        QDataStream stream(&cacheFile);
+        stream << static_cast<qint32>(stacks.size());
+        for (auto& stack : stacks) {
+            stream << stack.seq_ << stack.addr_ << stack.size_ << stack.time_
+                   << stack.library_.hashcode_ << stack.recType_ << stack.stacktraces_;
+        }
+        cacheFile.flush();
+
+        if (cacheFile.size() > 1024 * 1024 * 512) {
+            cacheIndex++;
+        }
+        cacheFile.close();
+    } else {
+        // Keep data in memory for fast processing (suitable for smaller datasets)
+        ReadStacktraceData(stacks);
     }
-    
-    static quint32 cacheIndex = 0;
-    auto cachePath = QString("%1/cache_%2.bin").arg(cacheDirPath).arg(cacheIndex);
-    QFile cacheFile(cachePath);
-    if (!cacheFile.open(QFile::OpenModeFlag::WriteOnly | QFile::OpenModeFlag::Append)) {
-        Print("Failed to open cache file: " + cachePath);
-        return;
-    }
-    
-    QDataStream stream(&cacheFile);
-    stream << static_cast<qint32>(stacks.size());
-    for (auto& stack : stacks) {
-        stream << stack.seq_ << stack.addr_ << stack.size_ << stack.time_
-               << stack.library_.hashcode_ << stack.recType_ << stack.stacktraces_;
-    }
-    cacheFile.flush();
-    
-    if (cacheFile.size() > 1024 * 1024 * 512) {
-        cacheIndex++;
-    }
-    cacheFile.close();
-    
+
     // Read free call infos
     if (frees.size() > 0) {
         for (const auto& free : frees) {
@@ -851,8 +856,10 @@ void CliProfiler::StopCaptureProcess() {
     if (!readSMaps) {
         Print("Failed to read proc/pid/smaps");
     } else {
-        Print("Reading cached record files...");
-        ReadStacktraceDataCache();
+        if (options_.enableMemoryOptimization) {
+            Print("Reading cached record files...");
+            ReadStacktraceDataCache();
+        }
         InterpretStacktraceData();
     }
     

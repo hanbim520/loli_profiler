@@ -30,6 +30,7 @@ public:
         int duration = 0;  // seconds, 0 means wait for process exit
         bool attachMode = false;
         bool verbose = false;
+        bool enableMemoryOptimization = false;  // stream data to disk cache instead of keeping in RAM
     };
 
     bool Initialize(const CliOptions& options);

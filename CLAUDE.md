@@ -42,6 +42,9 @@ LoliProfilerCLI --app com.example.game --out profile.loli --symbol /path/to/lib.
 # Profile until Ctrl+C
 LoliProfilerCLI --app com.example.game --out profile.loli --verbose
 
+# Profile with memory optimization (streams data to disk, recommended for large projects)
+LoliProfilerCLI --app com.example.game --out profile.loli --enable-memory-optimization
+
 # Compare two profiles to detect memory regressions
 LoliProfilerCLI --compare baseline.loli current.loli --out diff.txt
 

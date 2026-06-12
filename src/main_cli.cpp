@@ -138,9 +138,14 @@ int main(int argc, char *argv[]) {
         "Attach to running app instead of launching");
     parser.addOption(attachOption);
     
-    QCommandLineOption verboseOption(QStringList() << "verbose", 
+    QCommandLineOption verboseOption(QStringList() << "verbose",
         "Verbose output");
     parser.addOption(verboseOption);
+
+    QCommandLineOption enableMemoryOptimizationOption(QStringList() << "enable-memory-optimization",
+        "Stream captured data to disk cache instead of keeping in RAM. "
+        "Recommended for large projects that produce massive amounts of allocation data.");
+    parser.addOption(enableMemoryOptimizationOption);
     
     // Compare mode options
     QCommandLineOption compareOption(QStringList() << "compare",
@@ -422,6 +427,7 @@ int main(int argc, char *argv[]) {
     options.duration = parser.value(durationOption).toInt();
     options.attachMode = parser.isSet(attachOption);
     options.verbose = parser.isSet(verboseOption);
+    options.enableMemoryOptimization = parser.isSet(enableMemoryOptimizationOption);
     
     CLI_LOG("Configuration:");
     CLI_LOG(QString("  App: %1").arg(options.appName));

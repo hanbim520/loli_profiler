@@ -38,6 +38,7 @@ All options use Qt's standard format: `--option value` (double dash with space-s
 - `--duration <seconds>` - Profiling duration in seconds (omit for manual stop with Ctrl+C)
 - `--attach` - Attach to running app instead of launching new instance
 - `--verbose` - Enable verbose output for debugging
+- `--enable-memory-optimization` - Stream captured data to disk cache instead of keeping it in RAM. Recommended for large projects that produce massive amounts of allocation data (mirrors the "Enable Data Optimization?" prompt in GUI mode)
 - `--help` or `-h` - Display help message
 
 > All other options will use what you set in gui mode.
@@ -80,6 +81,17 @@ This is useful for:
 - Interactive profiling sessions where you control when to stop
 - Capturing specific gameplay scenarios
 - Ensuring complete memory mapping data is collected before shutdown
+
+### With Memory Optimization
+
+For large projects that generate massive amounts of allocation data, enable streaming to disk to reduce RAM usage:
+
+```bash
+LoliProfilerCLI.exe --app com.example.game --out profile.loli \
+  --enable-memory-optimization --duration 120
+```
+
+Data is streamed to `cache/` files during capture and read back at the end, keeping the profiler's RAM footprint low. Without this flag, all data is kept in memory (faster, but uses more RAM).
 
 ### Attach to Running App
 
@@ -148,7 +160,7 @@ This will show:
 | Duration | Manual stop button | Timed or Ctrl+C |
 | Progress | Visual progress bar | Console messages |
 | Symbol Loading | File dialog | `-symbol` flag |
-| Data Optimization | User prompt | Always enabled |
+| Data Optimization | User prompt on launch | `--enable-memory-optimization` flag (off by default)
 | Launch Mode | User prompt | `-attach` flag |
 
 ## Stopping Profiling
